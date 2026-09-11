@@ -16,6 +16,7 @@ from ..network.neighbor import NeighborTable
 from ..network.udp_node import UdpNode
 from ..simulation import physics
 from ..simulation.aircraft import Aircraft
+from ..simulation.airspace import random_cruise_altitude
 from ..simulation.conflict import Conflict, ConflictDetector
 from ..simulation.maneuver import generate_candidates, filter_candidates
 from ..simulation.cost import plan_cost
@@ -53,6 +54,7 @@ class AircraftAgent:
         self.active_conflict_key: str | None = None
         self._active_record = None
         self.active_conflicts: dict[str, float] = {}
+        self.hold_timer = 0.0
 
     @property
     def id(self) -> str:
@@ -304,6 +306,17 @@ class AircraftAgent:
         msgs = self.drain_inbox()
         self.apply_messages(msgs, now)
 
+        # Parked on a runway: sit quiet until takeoff, but keep broadcasting
+        # so neighbours never treat us as a silent/uncertain node.
+        if self.hold_timer > 0:
+            self.hold_timer -= dt
+            if self.hold_timer <= 0:
+                self.aircraft.held = False
+                self._begin_takeoff()
+            if self.tick % self.broadcast_every == 0:
+                self._broadcast_state(now)
+            return
+
         self.aircraft.advance(dt)
         if self.aircraft.plan is None:
             if not self.aircraft.reached_destination():
@@ -311,13 +324,41 @@ class AircraftAgent:
             else:
                 self.aircraft.waypoint = None
         if self.aircraft.reached_destination() and self.aircraft.plan is None:
-            self.aircraft.destination = self.airspace.next_destination()
+            self._begin_hold()
 
         if self.tick % self.broadcast_every == 0:
             self._broadcast_state(now)
 
         if self.tick % self.detect_every == 0:
             self._maybe_resolve_conflicts(now)
+
+    # ----- landing / takeoff lifecycle -----
+    def _begin_hold(self) -> None:
+        ac = self.aircraft
+        ac.held = True
+        ac.speed = 0.0
+        ac.plan = None
+        ac.position = ac.destination  # set down on the runway
+        ac.heading = 0.0
+        self.hold_timer = random.uniform(8.0, 14.0)
+
+    def _begin_takeoff(self) -> None:
+        ac = self.aircraft
+        ac.held = False
+        port = self.airspace.airport_by_id(ac.dest_aid) or self.airspace.random_airport()
+        next_port = self.airspace.random_airport(exclude_id=port.aid)
+        px, py, _ = port.position
+        tx, ty, _ = next_port.position
+        ac.position = port.position
+        ac.destination = next_port.position
+        ac.origin_aid = port.aid
+        ac.dest_aid = next_port.aid
+        ac.speed = random.uniform(140.0, 220.0)
+        ac.heading = math.atan2(tx - px, ty - py)
+        ac.cruise_altitude = random_cruise_altitude()
+        ac.leg_distance = max(1.0, math.hypot(tx - px, ty - py))
+        ac.leg_travelled = 0.0
+        ac.plan = None
 
     def _broadcast_state(self, now: float) -> None:
         a = self.aircraft

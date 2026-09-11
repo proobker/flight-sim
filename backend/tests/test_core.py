@@ -218,3 +218,49 @@ def test_aircraft_descends_without_waypoint_only():
     )
     ac.waypoint = (5000.0, 5000.0, 2000.0)
     assert ac.steer_velocity()[2] >= -25.0, "avoidance waypoint overrides descent"
+
+
+def test_maneuver_plan_expires_and_clears():
+    ac = Aircraft("T3", (0, 0, 1000), (1000, 0, 1000), speed=100.0, heading=0.0)
+    ac.commit(ac.maneuver_plan(heading_offset=0.0, vertical_rate=100.0), comment="climb")
+    assert ac.current_velocity()[2] == pytest.approx(100.0)
+    ac.advance(1.0)
+    assert ac.plan is not None
+    ac.advance(1.0)
+    assert ac.plan is not None
+    ac.advance(1.0)
+    assert ac.plan is None, "committed plan must clear once its duration elapses"
+    assert ac.current_velocity()[2] >= -25.0, "steering resumes after the maneuver ends"
+
+
+def test_cruise_altitudes_fall_in_discrete_bands():
+    from backend.simulation.airspace import ALTITUDE_BANDS, random_cruise_altitude
+
+    for _ in range(200):
+        a = random_cruise_altitude()
+        assert any(abs(a - b) <= 150.0 for b in ALTITUDE_BANDS), a
+
+
+def test_snapshot_includes_route_and_progress():
+    ac = Aircraft(
+        aircraft_id="R1",
+        position=(1000.0, 1000.0, 2000.0),
+        destination=(1200.0, 1000.0, 140.0),
+        speed=100.0,
+        cruise_altitude=2000.0,
+    )
+    ac.origin_aid = "APT1"
+    ac.dest_aid = "APT2"
+    ac.leg_distance = 20000.0
+    ac.leg_travelled = 10000.0
+    s = ac.snapshot()
+    assert s["origin_aid"] == "APT1"
+    assert s["dest_aid"] == "APT2"
+    assert s["state"] in ("landing", "cruise", "held")
+    assert s["progress"] == pytest.approx(0.5)
+
+
+def test_snapshot_state_held_when_parked_at_runway():
+    ac = Aircraft("R2", (500, 500, 140), (500, 500, 140), speed=0.0, cruise_altitude=2000.0)
+    ac.held = True
+    assert ac.snapshot()["state"] == "held"

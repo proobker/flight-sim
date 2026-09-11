@@ -15,7 +15,7 @@ from typing import Any
 
 from ..network.udp_node import UdpNode
 from ..simulation.aircraft import Aircraft
-from ..simulation.airspace import Airspace
+from ..simulation.airspace import Airspace, random_cruise_altitude
 from ..simulation.conflict import ConflictDetector
 from .agent import AircraftAgent
 from .metrics import Metrics
@@ -97,9 +97,12 @@ class Simulator:
                 destination=dest,
                 speed=speed,
                 heading=heading,
-                cruise_altitude=self.config.cruise_altitude,
+                cruise_altitude=random_cruise_altitude(self._rng),
                 priority=random.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
             )
+            ac.origin_aid = start.aid
+            ac.dest_aid = dest_airport.aid
+            ac.leg_distance = math.hypot(dest[0] - pos[0], dest[1] - pos[1])
             node = UdpNode(
                 aircraft_id=aid,
                 multicast_group=self.config.multicast_group,
@@ -136,15 +139,18 @@ class Simulator:
     async def spawn_emergency(self) -> AircraftAgent:
         aid = f"E{next(self._next_id):03d}"
         pos = self.airspace.random_point(self._rng, self.config.cruise_altitude)
-        dest = self.airspace.random_airport(self._rng).position
+        dest_port = self.airspace.random_airport(self._rng)
+        dest = dest_port.position
         ac = Aircraft(
             aircraft_id=aid,
             position=pos,
             destination=dest,
             speed=180.0,
             priority=4,
-            cruise_altitude=self.config.cruise_altitude,
+            cruise_altitude=random_cruise_altitude(self._rng),
         )
+        ac.dest_aid = dest_port.aid
+        ac.leg_distance = math.hypot(dest[0] - pos[0], dest[1] - pos[1])
         node = UdpNode(
             aircraft_id=aid,
             multicast_group=self.config.multicast_group,
@@ -274,7 +280,7 @@ class Simulator:
         self._update_stale_metrics()
 
     def _check_collisions_and_separation(self) -> None:
-        active = [a for a in self.agents if a.aircraft.active]
+        active = [a for a in self.agents if a.aircraft.active and not a.aircraft.held]
         min_sep = float("inf")
         for i in range(len(active)):
             for j in range(i + 1, len(active)):

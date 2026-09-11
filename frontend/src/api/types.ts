@@ -45,6 +45,11 @@ export interface AircraftSnapshot {
   priority: number;
   emergency: boolean;
   active: boolean;
+  origin_aid: string | null;
+  dest_aid: string | null;
+  state: "cruise" | "landing" | "held";
+  progress: number;
+  leg_distance: number;
   trajectory_version: number;
   waypoint: [number, number, number] | null;
   plan: [[number, number, number], number, number] | null;

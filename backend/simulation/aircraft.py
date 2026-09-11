@@ -68,6 +68,11 @@ class Aircraft:
         self.heading = heading
         self.active = True
         self.emergency = False
+        self.held = False
+        self.origin_aid: str | None = None
+        self.dest_aid: str | None = None
+        self.leg_distance = 1.0
+        self.leg_travelled = 0.0
 
         self.trajectory_version = 0
         self.plan: Plan | None = None
@@ -88,13 +93,18 @@ class Aircraft:
             return
         velocity = self.current_velocity()
         self.position = physics.advance(self.position, velocity, dt)
-        self.distance_travelled += math.hypot(velocity[0], velocity[1]) * dt
-        self.fuel_used += math.hypot(velocity[0], velocity[1]) * dt / 1000.0
+        h_speed = math.hypot(velocity[0], velocity[1])
+        self.distance_travelled += h_speed * dt
+        self.leg_travelled += h_speed * dt
+        self.fuel_used += h_speed * dt / 1000.0
         self.heading = math.atan2(velocity[0], velocity[1])
+        if self.plan is not None:
+            self.plan.duration = max(0.0, self.plan.duration - dt)
+            if self.plan.duration <= 0.0:
+                self.plan = None
 
     def current_velocity(self) -> tuple[float, float, float]:
         if self.plan is not None and self.plan.duration > 0:
-            self.plan.duration = max(0.0, self.plan.duration - 0.0)
             return self.plan.velocity
         return self.steer_velocity()
 
@@ -177,6 +187,12 @@ class Aircraft:
 
     def snapshot(self) -> dict[str, Any]:
         velocity = self.current_velocity()
+        if self.held:
+            state = "held"
+        elif self.is_landing():
+            state = "landing"
+        else:
+            state = "cruise"
         return {
             "id": self.id,
             "position": list(self.position),
@@ -189,6 +205,11 @@ class Aircraft:
             "priority": self.priority,
             "emergency": self.emergency,
             "active": self.active,
+            "origin_aid": self.origin_aid,
+            "dest_aid": self.dest_aid,
+            "state": state,
+            "progress": min(1.0, self.leg_travelled / max(1.0, self.leg_distance)),
+            "leg_distance": round(self.leg_distance, 1),
             "trajectory_version": self.trajectory_version,
             "plan": (
                 [list(self.plan.velocity), self.plan.duration, self.plan.version]

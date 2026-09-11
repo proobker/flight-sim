@@ -10,6 +10,14 @@ from typing import Any
 
 AIRPORT_NAMES = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"]
 
+# Discrete cruise levels so neighbouring flights sit in different bands.
+ALTITUDE_BANDS = [1200.0, 1600.0, 2000.0, 2600.0, 3200.0]
+
+
+def random_cruise_altitude(rng=None) -> float:
+    rng = rng or random
+    return rng.choice(ALTITUDE_BANDS) + rng.uniform(-150.0, 150.0)
+
 
 @dataclass
 class Airport:

@@ -12,11 +12,33 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { SimSnapshot, AircraftSnapshot, Airport } from "../api/types";
 
-const PRIORITY_COLORS = [0xaaddff, 0xffaa44, 0x44dd88, 0xffdd44, 0xff4444];
 const COMM_LINE_COLOR = 0x336688;
 const STALE_LINE_COLOR = 0x995533;
 const CONFLICT_COLOR = 0xff2222;
 const WAYPOINT_COLOR = 0xffaa44;
+
+// Deterministic palette keyed to airport id (APT1..APT6).
+const AIRPORT_COLORS = [0xe8593a, 0xe8a33a, 0x4ac95f, 0x3ac9c9, 0x4a7fe8, 0xb56ce8];
+
+function airportColorById(id: string | null | undefined): number {
+  const m = /(\d+)$/.exec(id ?? "");
+  if (!m) return 0x8899aa;
+  const i = parseInt(m[1], 10) - 1;
+  return AIRPORT_COLORS[(i % AIRPORT_COLORS.length + AIRPORT_COLORS.length) % AIRPORT_COLORS.length];
+}
+
+function wrapAngleToPi(a: number): number {
+  return ((a + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+}
+
+function clamp01(t: number): number {
+  return t < 0 ? 0 : t > 1 ? 1 : t;
+}
+
+function smoothstep01(t: number): number {
+  t = clamp01(t);
+  return t * t * (3 - 2 * t);
+}
 
 const NIGHT_SKY = { top: 0x071030, mid: 0x1a3050, bottom: 0x0e1818 };
 const DAY_SKY = { top: 0x2277cc, mid: 0x66bbee, bottom: 0xcceeff };
@@ -78,6 +100,9 @@ function buildAirplane(color: number): {
   const fin = new THREE.Mesh(FIN_GEO, mat);
   fin.position.set(0, 48, -140);
   group.add(fin);
+  group.traverse((o) => {
+    if (o instanceof THREE.Mesh) o.castShadow = true;
+  });
   return { group, mat };
 }
 
@@ -171,28 +196,65 @@ function makeTextSprite(text: string, color: number): THREE.Sprite {
   return new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
 }
 
-function makeDestMarker(color: number): THREE.Group {
-  const group = new THREE.Group();
-  const pole = new THREE.Mesh(
-    new THREE.CylinderGeometry(5, 5, 240, 6),
-    new THREE.MeshPhongMaterial({ color: 0x666688 }),
-  );
-  pole.position.y = 120;
-  group.add(pole);
-  const head = new THREE.Mesh(
-    new THREE.ConeGeometry(18, 38, 8),
-    new THREE.MeshPhongMaterial({ color, emissive: color, emissiveIntensity: 0.3 }),
-  );
-  head.position.y = 270;
-  group.add(head);
-  const ring = new THREE.Mesh(
-    new THREE.RingGeometry(28, 42, 24),
-    new THREE.MeshBasicMaterial({ color, opacity: 0.35, transparent: true, side: THREE.DoubleSide }),
-  );
-  ring.rotation.x = -Math.PI / 2;
-  ring.position.y = 2;
-  group.add(ring);
-  return group;
+/**
+ * A tiling value-noise field plus fbm helpers used to sculpt the terrain
+ * heightfield. Lattice wraps at 256 cells so octaves with integer frequency
+ * stay seamless.
+ */
+function makeNoiseField(seed: number) {
+  const CW = 256;
+  const rnd = mulberry32(seed);
+  const lattice = new Float64Array(CW * CW);
+  for (let i = 0; i < CW * CW; i++) lattice[i] = rnd();
+
+  function value(x: number, y: number): number {
+    const xi = ((Math.floor(x) % CW) + CW) % CW;
+    const yi = ((Math.floor(y) % CW) + CW) % CW;
+    const fx = x - Math.floor(x);
+    const fy = y - Math.floor(y);
+    const sx = fx * fx * (3 - 2 * fx);
+    const sy = fy * fy * (3 - 2 * fy);
+    const a = lattice[yi * CW + xi];
+    const b = lattice[yi * CW + ((xi + 1) % CW)];
+    const c = lattice[((yi + 1) % CW) * CW + xi];
+    const d = lattice[((yi + 1) % CW) * CW + ((xi + 1) % CW)];
+    const top = a + (b - a) * sx;
+    const bot = c + (d - c) * sx;
+    return top + (bot - top) * sy;
+  }
+
+  function fbm(x: number, y: number, octaves: number): number {
+    let s = 0;
+    let n = 0;
+    let a = 1;
+    let f = 1;
+    for (let i = 0; i < octaves; i++) {
+      s += a * value(x * f, y * f);
+      n += a;
+      a *= 0.5;
+      f *= 2;
+    }
+    return s / n;
+  }
+
+  function ridged(x: number, y: number, octaves: number): number {
+    let s = 0;
+    let n = 0;
+    let a = 1;
+    let f = 1;
+    for (let i = 0; i < octaves; i++) {
+      const v = value(x * f, y * f);
+      let r = 1 - Math.abs(2 * v - 1);
+      r *= r;
+      s += a * r;
+      n += a;
+      a *= 0.5;
+      f *= 2;
+    }
+    return s / n;
+  }
+
+  return { value, fbm, ridged };
 }
 
 // A material whose colour we can flip between day / night / closed.
@@ -215,10 +277,16 @@ class AircraftVisual {
   trailPoints: THREE.Vector3[] = [];
   trailLine: THREE.Line;
 
-  constructor(priority: number) {
+  private originColor: THREE.Color;
+  private destColor: THREE.Color;
+  private smoothHeading: number | null = null;
+  private bankAngle = 0;
+
+  constructor(originColor: number, destColor: number) {
     this.group = new THREE.Group();
-    const color = PRIORITY_COLORS[priority] ?? 0xaaddff;
-    const { group, mat } = buildAirplane(color);
+    this.originColor = new THREE.Color(originColor);
+    this.destColor = new THREE.Color(destColor);
+    const { group, mat } = buildAirplane(originColor);
     this.airplane = group;
     this.airplaneMat = mat;
     this.group.add(this.airplane);
@@ -252,8 +320,18 @@ class AircraftVisual {
     const pos = toThree(ac.position);
     this.group.position.copy(pos);
 
-    this.airplane.rotation.set(0, -ac.heading, 0);
-    this.airplaneMat.color.setHex(PRIORITY_COLORS[ac.priority] ?? 0xaaddff);
+    // Heading smooths towards the true bearing and the plane banks into the
+    // turn, so the body always leads the motion nose-first (never tail/sideways).
+    if (this.smoothHeading === null) this.smoothHeading = ac.heading;
+    const rawDelta = wrapAngleToPi(ac.heading - this.smoothHeading);
+    this.smoothHeading = wrapAngleToPi(this.smoothHeading + rawDelta * 0.35);
+    const bankTarget = THREE.MathUtils.clamp(-rawDelta * 0.55, -0.55, 0.55);
+    this.bankAngle += (bankTarget - this.bankAngle) * 0.18;
+    const pitch = THREE.MathUtils.clamp(-ac.vertical_rate * 0.004, -0.22, 0.22);
+    this.airplane.rotation.set(pitch, this.smoothHeading, this.bankAngle);
+
+    // Body colour fades from origin airport to destination airport across the leg.
+    this.airplaneMat.color.copy(this.originColor).lerp(this.destColor, clamp01(ac.progress));
     this.airplaneMat.emissive.setHex(ac.emergency ? 0xff2222 : 0x000000);
 
     const v = ac.velocity;
@@ -303,12 +381,14 @@ class AircraftVisual {
       this.waypointLine.visible = false;
     }
 
-    this.trailPoints.push(pos.clone());
-    if (this.trailPoints.length > 30) this.trailPoints.shift();
-    if (this.trailPoints.length > 1) {
-      const local = this.trailPoints.map((p) => p.clone().sub(pos));
-      this.trailLine.geometry.dispose();
-      this.trailLine.geometry = new THREE.BufferGeometry().setFromPoints(local);
+    if (ac.state !== "held") {
+      this.trailPoints.push(pos.clone());
+      if (this.trailPoints.length > 30) this.trailPoints.shift();
+      if (this.trailPoints.length > 1) {
+        const local = this.trailPoints.map((p) => p.clone().sub(pos));
+        this.trailLine.geometry.dispose();
+        this.trailLine.geometry = new THREE.BufferGeometry().setFromPoints(local);
+      }
     }
   }
 
@@ -341,11 +421,12 @@ export class SkyScene {
   container: HTMLElement;
 
   aircraftMap: Map<string, AircraftVisual> = new Map();
-  destMarkers: Map<string, THREE.Group> = new Map();
   conflictLines: THREE.Line[] = [];
   neighborLines: THREE.Line[] = [];
   obstacleGroups: Map<string, THREE.Group> = new Map();
   uncertainMeshes: Map<string, THREE.Mesh> = new Map();
+
+  sunLight: THREE.DirectionalLight;
 
   boundsGroup: THREE.Group;
   skyMesh: THREE.Mesh | null = null;
@@ -354,6 +435,8 @@ export class SkyScene {
   groundMesh: THREE.Mesh | null = null;
   terrainGroup: THREE.Group | null = null;
 
+  private terrainMat: THREE.MeshLambertMaterial | null = null;
+  private heightAt: (sx: number, sy: number) => number = () => 0;
   private airportGroups: Map<string, THREE.Group> = new Map();
   private airportThemes: Map<string, ThemedMat[]> = new Map();
   private terrainThemes: ThemedMat[] = [];
@@ -371,6 +454,8 @@ export class SkyScene {
     this.renderer.setSize(w, h);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setClearColor(NIGHT_CLEAR);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
@@ -391,7 +476,18 @@ export class SkyScene {
     this.scene.add(new THREE.AmbientLight(0xffffff, 0.35));
     const dir = new THREE.DirectionalLight(0xfff8e8, 0.85);
     dir.position.set(10000, 18000, 5000);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(2048, 2048);
+    dir.shadow.camera.near = 1000;
+    dir.shadow.camera.far = 30000;
+    dir.shadow.camera.left = -2200;
+    dir.shadow.camera.right = 2200;
+    dir.shadow.camera.top = 2200;
+    dir.shadow.camera.bottom = -2200;
+    dir.shadow.bias = -0.0006;
     this.scene.add(dir);
+    this.scene.add(dir.target);
+    this.sunLight = dir;
     this.scene.add(new THREE.HemisphereLight(0x8888ff, 0x443322, 0.3));
 
     this.boundsGroup = new THREE.Group();
@@ -568,6 +664,7 @@ export class SkyScene {
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(width / 2, floor - GROUND_CLEARANCE, depth / 2);
+    mesh.receiveShadow = true;
     this.scene.add(mesh);
     this.groundMesh = mesh;
   }
@@ -575,6 +672,14 @@ export class SkyScene {
   private animate = () => {
     requestAnimationFrame(this.animate);
     this.controls.update();
+    // Keep the shadow-casting sun pinned to the viewer so shadows are crisp
+    // wherever the camera is instead of spanning the whole sim.
+    const sunDir = this.viewOptions.dayMode
+      ? new THREE.Vector3(0.55, 0.9, 0.25)
+      : new THREE.Vector3(-0.7, 0.4, -0.3);
+    this.sunLight.position.copy(this.camera.position).addScaledVector(sunDir, 6000);
+    this.sunLight.target.position.copy(this.camera.position);
+    this.sunLight.target.updateMatrixWorld();
     this.renderer.render(this.scene, this.camera);
   };
 
@@ -599,7 +704,6 @@ export class SkyScene {
     this.updateConflicts(snapshot.aircraft);
     this.updateNeighborLines(snapshot.aircraft);
     this.updateUncertainty(snapshot);
-    this.updateDestMarkers(snapshot.aircraft);
   }
 
   private updateBounds(width: number, depth: number, floor: number, _ceiling: number) {
@@ -670,6 +774,8 @@ export class SkyScene {
     const padMat = new THREE.MeshPhongMaterial({ opacity: 0.85, transparent: true });
     const pad = new THREE.Mesh(new THREE.CylinderGeometry(apt.radius * 0.62, apt.radius * 0.62, 26, 28), padMat);
     pad.position.set(px, groundY + 13, pz);
+    pad.receiveShadow = true;
+    pad.castShadow = true;
     group.add(pad);
     themes.push({ mat: padMat, day: 0x595961, night: 0x1a2026, closed: 0x5a2f2b });
 
@@ -679,6 +785,7 @@ export class SkyScene {
       const rwy = new THREE.Mesh(new THREE.BoxGeometry(rLen, 6, 26), rwyMat);
       rwy.position.set(px, groundY + 16, pz);
       rwy.rotation.y = angle;
+      rwy.receiveShadow = true;
       group.add(rwy);
       themes.push({ mat: rwyMat, day: 0xe2e2e2, night: 0x8a95a8, closed: 0xbb7777 });
     }
@@ -686,14 +793,44 @@ export class SkyScene {
     const termMat = new THREE.MeshPhongMaterial();
     const term = new THREE.Mesh(new THREE.BoxGeometry(140, 60, 80), termMat);
     term.position.set(px + apt.radius * 0.62 * 0.55, groundY + 30, pz);
+    term.castShadow = true;
+    term.receiveShadow = true;
     group.add(term);
     themes.push({ mat: termMat, day: 0x9aa0a6, night: 0x22262c, closed: 0x74423b });
 
     const roofMat = new THREE.MeshPhongMaterial();
     const roof = new THREE.Mesh(new THREE.BoxGeometry(150, 12, 92), roofMat);
     roof.position.set(px + apt.radius * 0.62 * 0.55, groundY + 62, pz);
+    roof.castShadow = true;
     group.add(roof);
     themes.push({ mat: roofMat, day: 0x61666b, night: 0x14171c, closed: 0x552e28 });
+
+    // Airport identity beacon: a lit ring around the pad and a small cone so
+    // each field reads instantly in its own colour (matches plane gradients).
+    const beaconColor = airportColorById(apt.id);
+    const ringMat = new THREE.MeshPhongMaterial({
+      color: beaconColor,
+      emissive: beaconColor,
+      emissiveIntensity: 0.45,
+      opacity: 0.3,
+      transparent: true,
+      side: THREE.DoubleSide,
+    });
+    const ring = new THREE.Mesh(new THREE.RingGeometry(apt.radius * 0.74, apt.radius * 0.82, 40), ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(px, groundY + 20, pz);
+    group.add(ring);
+    themes.push({ mat: ringMat, day: beaconColor, night: beaconColor, closed: 0x3a3a3a });
+
+    const beaconMat = new THREE.MeshPhongMaterial({
+      color: 0xffffff,
+      emissive: beaconColor,
+      emissiveIntensity: 0.8,
+    });
+    const beacon = new THREE.Mesh(new THREE.ConeGeometry(16, 40, 8), beaconMat);
+    beacon.position.set(px + apt.radius * 0.62 * 0.55, groundY + 92, pz);
+    group.add(beacon);
+    themes.push({ mat: beaconMat, day: 0xffffff, night: 0xffffff, closed: 0x666666 });
 
     const label = makeTextSprite(apt.closed ? "CLOSED" : apt.name, 0xffffff);
     label.position.set(px, groundY + 110, pz);
@@ -735,7 +872,7 @@ export class SkyScene {
     }
   }
 
-  // ────── terrain (hills, mountains, trees, rocks) ──────
+  // ────── terrain (real heightfield: hill ranges, mountain ranges) ──────
 
   private ensureTerrain() {
     if (this.terrainGroup) return;
@@ -745,19 +882,125 @@ export class SkyScene {
     this.scene.add(group);
 
     const rnd = mulberry32(1337);
-    const cx = air.width / 2;
-    const cz = air.depth / 2;
-    const mainHalf = air.width + 12000;
-    const groundY = air.floor - GROUND_CLEARANCE;
-    const airports = air.airports.map((a) => a.center);
+    const noise = makeNoiseField(1337);
+    const areaCX = air.width / 2;
+    const areaCZ = air.depth / 2;
+    const regionHalf = 22000;
+    const MAXH = 720;
+    const baseY = air.floor - GROUND_CLEARANCE;
+    const airports = air.airports.map((a) => ({
+      lx: a.center[0] - areaCX,
+      lz: a.center[1] - areaCZ,
+      r: a.radius,
+    }));
+
+    const hillBands = [
+      { angle: 0.25, period: 3400, amp: 150 },
+      { angle: 1.15, period: 4600, amp: 130 },
+      { angle: -0.8, period: 5200, amp: 110 },
+      { angle: 2.2, period: 3000, amp: 90 },
+      { angle: -2.0, period: 6400, amp: 100 },
+    ];
+    const spines = [
+      { angle: -0.45, width: 4300, amp: 560, scale: 2700 },
+      { angle: 0.9, width: 3400, amp: 460, scale: 2300 },
+      { angle: 2.35, width: 5000, amp: 660, scale: 3100 },
+    ];
+
+    this.heightAt = (sx: number, sy: number) => {
+      const lx = sx - areaCX;
+      const ly = sy - areaCZ;
+
+      let h = (noise.fbm(lx / 1100, ly / 1100, 3) - 0.5) * 26; // meadow bump ±13
+
+      for (const b of hillBands) {
+        const along = lx * Math.cos(b.angle) + ly * Math.sin(b.angle);
+        h += Math.sin((along / b.period) * Math.PI * 2) * b.amp;
+      }
+
+      for (const s of spines) {
+        const across = -lx * Math.sin(s.angle) + ly * Math.cos(s.angle);
+        const band = Math.exp(-(across * across) / (2 * s.width * s.width));
+        if (band < 0.02) continue;
+        const along = lx * Math.cos(s.angle) + ly * Math.sin(s.angle);
+        h += band * s.amp * noise.ridged(along / s.scale, across / s.scale, 4);
+      }
+
+      // Flatten around airports so runways sit exactly level.
+      for (const a of airports) {
+        const d = Math.hypot(lx - a.lx, ly - a.lz);
+        const R = a.r * 1.5;
+        if (d < R) h *= smoothstep01(d / R);
+      }
+
+      // Fade to the flat infinite plane at the rim, dipping just under it so
+      // the two surfaces never z-fight along the seam.
+      const n = Math.max(Math.abs(lx), Math.abs(ly)) / regionHalf;
+      const eff = smoothstep01((n - 0.82) / 0.18);
+      h = h * (1 - eff) - 2 * eff;
+
+      return Math.max(-2, Math.min(MAXH, h));
+    };
+
+    // ── heightfield mesh (dense near the sim centre, coarse at the rim) ──
+    const N = 430;
+    const cols = N + 1;
+    const vertexCount = cols * cols;
+    const positions = new Float32Array(vertexCount * 3);
+    const colors = new Float32Array(vertexCount * 3);
+    const indices: number[] = [];
+
+    const compression = 3.1;
+    const tanhC = Math.tanh(compression);
+    const mapU = (u: number) => Math.tanh((u - 0.5) * 2 * compression) / tanhC;
+
+    for (let r = 0; r < cols; r++) {
+      for (let c = 0; c < cols; c++) {
+        const lx = mapU(c / N) * regionHalf;
+        const ly = mapU(r / N) * regionHalf;
+        const sx = areaCX + lx;
+        const sy = areaCZ + ly;
+        const hgt = this.heightAt(sx, sy);
+        const i = r * cols + c;
+        positions[i * 3 + 0] = sx;
+        positions[i * 3 + 1] = baseY + hgt;
+        positions[i * 3 + 2] = sy;
+
+        // Vertex tint: subtle rocky crests above ~480 m, rest stays ground-green.
+        const crest = clamp01((hgt - 480) / (MAXH - 480));
+        const vib = 0.05 * (noise.fbm(sx / 700, sy / 700, 2) - 0.5);
+        colors[i * 3 + 0] = 1 - 0.3 * crest + vib;
+        colors[i * 3 + 1] = 1 - 0.2 * crest + vib;
+        colors[i * 3 + 2] = 1 - 0.4 * crest + vib;
+      }
+    }
+    for (let r = 0; r < N; r++) {
+      for (let c = 0; c < N; c++) {
+        const a = r * cols + c;
+        const b = a + cols;
+        indices.push(a, b, a + 1);
+        indices.push(a + 1, b, b + 1);
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    const heightfield = new THREE.Mesh(geo, mat);
+    heightfield.castShadow = true;
+    heightfield.receiveShadow = true;
+    group.add(heightfield);
+    this.terrainMat = mat;
 
     const clearOf = (x: number, z: number, r: number) =>
-      airports.every(([ax, , az]) => Math.hypot(x - ax, z - az) > r);
+      airports.every((a) => Math.hypot(x - areaCX - a.lx, z - areaCZ - a.lz) > r);
 
     const scatter = (half: number, minClear: number): [number, number] | null => {
       for (let tries = 0; tries < 12; tries++) {
-        const x = cx + (rnd() * 2 - 1) * half;
-        const z = cz + (rnd() * 2 - 1) * half;
+        const x = areaCX + (rnd() * 2 - 1) * half;
+        const z = areaCZ + (rnd() * 2 - 1) * half;
         if (clearOf(x, z, minClear)) return [x, z];
       }
       return null;
@@ -768,41 +1011,13 @@ export class SkyScene {
       return mat;
     };
 
-    // rolling hills
-    for (let i = 0; i < 90; i++) {
-      const spot = scatter(mainHalf, 1500);
-      if (!spot) continue;
-      const rx = 260 + rnd() * 360;
-      const rz = rx * (0.8 + rnd() * 0.4);
-      const ry = 40 + rnd() * 140;
-      const mat = themed(new THREE.MeshLambertMaterial(), 0x3e7d33, 0x0f2214);
-      const hill = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8), mat);
-      hill.scale.set(rx, ry, rz);
-      hill.position.set(spot[0], groundY + ry * 0.5, spot[1]);
-      group.add(hill);
-    }
-
-    // mountains
-    for (let i = 0; i < 12; i++) {
-      const spot = scatter(mainHalf * 0.8, 2200);
-      if (!spot) continue;
-      const rx = 360 + rnd() * 420;
-      const rz = rx * (0.8 + rnd() * 0.4);
-      const ry = 260 + rnd() * 260;
-      const mat = themed(new THREE.MeshLambertMaterial(), 0x6d796c, 0x21271f);
-      const mountain = new THREE.Mesh(new THREE.ConeGeometry(1, 1, 6), mat);
-      mountain.scale.set(rx, ry, rz);
-      mountain.position.set(spot[0], groundY + ry * 0.5, spot[1]);
-      group.add(mountain);
-    }
-
-    // trees in small clusters
+    // trees in small clusters, snapped onto the terrain surface
     const treeMat = themed(new THREE.MeshLambertMaterial(), 0x2f6b2f, 0x0e2416);
     const trunkMat = themed(new THREE.MeshLambertMaterial(), 0x6b5233, 0x241a0e);
     const treeGeo = new THREE.ConeGeometry(1, 1, 5);
     const trunkGeo = new THREE.CylinderGeometry(1, 1, 1, 5);
     for (let i = 0; i < 30; i++) {
-      const spot = scatter(mainHalf * 0.9, 1600);
+      const spot = scatter(9000, 1700);
       if (!spot) continue;
       const n = 3 + Math.floor(rnd() * 3);
       for (let j = 0; j < n; j++) {
@@ -811,42 +1026,46 @@ export class SkyScene {
         if (!clearOf(ox, oz, 1300)) continue;
         const h = 34 + rnd() * 26;
         const tw = h * (0.45 + rnd() * 0.2);
+        const groundY = baseY + this.heightAt(ox, oz);
         const tree = new THREE.Mesh(treeGeo, treeMat);
         tree.scale.set(tw, h, tw);
         tree.position.set(ox, groundY + h * 0.5, oz);
+        tree.castShadow = true;
         group.add(tree);
         const trunk = new THREE.Mesh(trunkGeo, trunkMat);
         trunk.scale.set(tw * 0.18, h * 0.18, tw * 0.18);
         trunk.position.set(ox, groundY + h * 0.1, oz);
+        trunk.castShadow = true;
         group.add(trunk);
       }
     }
 
     // rocks
     const rockMat = themed(new THREE.MeshLambertMaterial(), 0x7a7f74, 0x262c2f);
-    for (let i = 0; i < 14; i++) {
-      const spot = scatter(mainHalf * 0.7, 1400);
+    for (let i = 0; i < 12; i++) {
+      const spot = scatter(11000, 1500);
       if (!spot) continue;
       const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(1, 0), rockMat);
       const s = 12 + rnd() * 22;
       rock.scale.set(s, s * 0.7, s);
-      rock.position.set(spot[0], groundY + s * 0.35, spot[1]);
+      rock.position.set(spot[0], baseY + this.heightAt(spot[0], spot[1]) + s * 0.35, spot[1]);
+      rock.castShadow = true;
       group.add(rock);
     }
 
-    // far hills — sparse relief toward the horizon
+    // far hills — sparse relief toward the horizon, outside the heightfield
     const farMat = themed(new THREE.MeshLambertMaterial(), 0x38702f, 0x0c1e12);
     for (let i = 0; i < 40; i++) {
       const ringR = 34000 + rnd() * 44000;
       const a = rnd() * Math.PI * 2;
-      const x = cx - 7500 + Math.cos(a) * ringR;
-      const z = cz - 7500 + Math.sin(a) * ringR;
+      const x = areaCX - 7500 + Math.cos(a) * ringR;
+      const z = areaCZ - 7500 + Math.sin(a) * ringR;
       if (!clearOf(x, z, 3000)) continue;
       const w0 = 340 + rnd() * 420;
       const h0 = 30 + rnd() * 110;
       const far = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 7), farMat);
       far.scale.set(w0, h0, w0 * (0.8 + rnd() * 0.4));
-      far.position.set(x, groundY + h0 * 0.5, z);
+      far.position.set(x, baseY + h0 * 0.5, z);
       group.add(far);
     }
 
@@ -854,6 +1073,9 @@ export class SkyScene {
   }
 
   private applyTerrainTheme(day: boolean) {
+    if (this.terrainMat) {
+      this.terrainMat.color.setHex(day ? 0x4a8c3f : 0x0e1f14);
+    }
     for (const t of this.terrainThemes) {
       t.mat.color.setHex(day ? t.day : t.night);
     }
@@ -934,7 +1156,10 @@ export class SkyScene {
     for (const ac of aircraft) {
       let vis = this.aircraftMap.get(ac.id);
       if (!vis) {
-        vis = new AircraftVisual(ac.priority);
+        vis = new AircraftVisual(
+          airportColorById(ac.origin_aid),
+          airportColorById(ac.dest_aid),
+        );
         this.scene.add(vis.group);
         this.aircraftMap.set(ac.id, vis);
       }
@@ -945,34 +1170,6 @@ export class SkyScene {
         this.scene.remove(vis.group);
         vis.dispose();
         this.aircraftMap.delete(id);
-      }
-    }
-  }
-
-  private updateDestMarkers(aircraft: AircraftSnapshot[]) {
-    const activeIds = new Set(aircraft.map((a) => a.id));
-    for (const ac of aircraft) {
-      let marker = this.destMarkers.get(ac.id);
-      if (!marker) {
-        marker = makeDestMarker(PRIORITY_COLORS[ac.priority] ?? 0x88ccff);
-        this.scene.add(marker);
-        this.destMarkers.set(ac.id, marker);
-      }
-      marker.position.copy(toThree(ac.destination));
-    }
-    for (const [id, marker] of this.destMarkers) {
-      if (!activeIds.has(id)) {
-        this.scene.remove(marker);
-        marker.traverse((child) => {
-          if (child instanceof THREE.Mesh) {
-            child.geometry.dispose();
-            (child.material as THREE.Material).dispose();
-          }
-          if (child instanceof THREE.Sprite) {
-            (child.material as THREE.Material).dispose();
-          }
-        });
-        this.destMarkers.delete(id);
       }
     }
   }
@@ -1035,14 +1232,20 @@ export class SkyScene {
     const staleIds = new Set<string>();
     for (const ac of snapshot.aircraft) {
       for (const nb of ac.neighbors) {
-        if (nb.state !== "UNRESPONSIVE" && nb.age < 5) continue;
-        const radius = 150 + 40 * nb.age;
+        if (nb.state !== "UNRESPONSIVE") continue;
+        const radius = Math.min(150 + 40 * nb.age, 400);
         staleIds.add(nb.id);
         let mesh = this.uncertainMeshes.get(nb.id);
         if (!mesh) {
           mesh = new THREE.Mesh(
             new THREE.SphereGeometry(radius, 16, 12),
-            new THREE.MeshBasicMaterial({ color: 0xff4444, opacity: 0.08, transparent: true }),
+            new THREE.MeshBasicMaterial({
+              color: 0xff5533,
+              wireframe: true,
+              transparent: true,
+              opacity: 0.22,
+              depthWrite: false,
+            }),
           );
           this.scene.add(mesh);
           this.uncertainMeshes.set(nb.id, mesh);

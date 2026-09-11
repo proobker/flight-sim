@@ -36,8 +36,8 @@ class NeighborEntry:
     def age(self, now: float) -> float:
         return max(0.0, now - self.last_seen)
 
-    def state(self, stat_timeout: float, hard_timeout: float) -> str:
-        age = self.age(0.0)
+    def state(self, now: float, stat_timeout: float, hard_timeout: float) -> str:
+        age = self.age(now)
         if age >= hard_timeout:
             return UNRESPONSIVE
         if age >= stat_timeout:
@@ -103,7 +103,7 @@ class NeighborTable:
                 {
                     "id": e.aircraft_id,
                     "age": e.age(now),
-                    "state": e.state(self.stale_timeout, self.hard_timeout),
+                    "state": e.state(now, self.stale_timeout, self.hard_timeout),
                     "confidence": e.confidence,
                     "distance": distance,
                 }
