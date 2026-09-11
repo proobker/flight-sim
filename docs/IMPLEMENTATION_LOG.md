@@ -1,5 +1,53 @@
 # SkyMesh — Implementation Log
 
+## v0.2.0 (v2) — Frontend 3D Visualization (React + TypeScript + Three.js)
+
+### Date: September 11 2026
+
+### Summary
+
+Added the browser frontend: a Three.js 3D airspace view fed by the backend WebSocket, with a live dashboard and a failure-injection control panel. Build verified, screenshot-captured against a live backend (aircraft + conflict markers confirmed rendering).
+
+### What was built
+
+- **`frontend/`** — Vite + React 18 + TypeScript + Three.js project.
+
+- **`src/api/types.ts`** — TypeScript types mirroring the backend snapshot schema (`SimSnapshot`, `AircraftSnapshot`, `Obstacle`, `NeighborInfo`, …).
+
+- **`src/hooks/useSimulationSocket.ts`** — WebSocket client for `/ws` with auto-reconnect (1.5s retry) and a connected status flag.
+
+- **`src/visualization/SkyScene.ts`** — Core Three.js engine:
+  - Aircraft rendered as cone markers colored by priority (normal=cyan, cargo=orange, passenger=green, medical=yellow, emergency=red), rotated along heading, with pulsing red emissive for emergency aircraft.
+  - Dashed predicted-velocity vector per aircraft (15 s projection, capped 2.5 km).
+  - Faint destination lines and 30-point position trails.
+  - Red conflict lines connecting aircraft pairs currently in conflict (`conflict_with`).
+  - Communication links: translucent cyan lines to active neighbors, amber for stale neighbors.
+  - Obstacles (no-fly/storm/airport) as translucent cylinders.
+  - Uncertainty regions: translucent red spheres that grow with neighbor `age` for stale/unresponsive peers.
+  - Grid floor + airspace bounds wireframe; OrbitControls camera; fog for depth.
+
+- **`src/components/Dashboard.tsx`** — Live metrics overlay: aircraft count, active conflicts, resolved/detected, collisions, near misses, min separation (km), avg resolution (ms), nodes failed, partitions, sim time.
+
+- **`src/components/ControlPanel.tsx`** — Failure-injection panel calling the REST API:
+  - Kill 5 / 20 random aircraft, spawn emergency
+  - Partition / rejoin network
+  - Packet-loss slider (0–100%), latency input (0–5000 ms)
+  - Create storm, add no-fly zone, close airport, spawn N aircraft
+
+- **`src/App.tsx`**, **`vite.config.ts`** — Dev proxy forwards `/api` and `/ws` to the backend on port 8000; connection status badge (● LIVE / ○ RECONNECTING).
+
+### Verification
+
+- `npm run build` passes (tsc strict + vite build).
+- Live E2E via headless Edge against a running backend: HTTP 200, WS proxy delivers snapshots, screenshot analysis confirmed ~2.4k cyan aircraft pixels and ~1k red emergency/conflict pixels rendered in the 3D scene.
+
+### Notes
+
+- Coordinates map sim `(x, y, z_alt)` → three `(x, z_alt, y)` so altitude is the vertical axis.
+- Screenshot saved to `docs/screenshot.png`.
+
+---
+
 ## v0.1.0 (v1) — Simulation Core + Backend + REST API + WebSocket
 
 ### Date: September 11 2026

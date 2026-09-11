@@ -1,0 +1,86 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  background: #0a0a1a;
+  color: #dbe6ff;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+canvas {
+  display: block;
+}
+
+.panel {
+  position: absolute;
+  background: #0a0e1ccc;
+  backdrop-filter: blur(6px);
+  border: 1px solid #223052;
+  border-radius: 10px;
+  padding: 14px;
+  font-size: 13px;
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+}
+
+.dashboard {
+  top: 12px;
+  left: 12px;
+  min-width: 230px;
+  opacity: 0.92;
+}
+
+.dashboard h2 {
+  font-size: 16px;
+  letter-spacing: 3px;
+  margin-bottom: 8px;
+  color: #cfe0ff;
+}
+
+.dashboard .dot {
+  color: #ff4444;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.controls {
+  top: 12px;
+  right: 12px;
+  width: 220px;
+  opacity: 0.92;
+}
+
+.controls h2 {
+  font-size: 12px;
+  letter-spacing: 2px;
+  color: #ffcc88;
+  margin-bottom: 6px;
+}
+
+.controls h3 {
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: #8899bb;
+  margin: 10px 0 4px;
+  text-transform: uppercase;
+}
+
+.controls button:hover {
+  filter: brightness(1.3);
+}
+
+.controls input::-webkit-slider-thumb {
+  background: #ffcc88;
+}

@@ -47,7 +47,12 @@ python -m backend.run --serve --aircraft 60 --port 8000
 cd frontend
 npm install
 npm run dev
+# → http://localhost:5173  (visualizes the sim via WebSocket)
 ```
+
+Start the backend first (`python -m backend.run --serve`), then the frontend. The Vite dev server proxies `/api` and `/ws` to port 8000.
+
+![SkyMesh 3D visualization](docs/screenshot.png)
 
 ## REST API
 
