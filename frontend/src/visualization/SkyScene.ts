@@ -4,6 +4,7 @@
  * Renders airplane markers, predicted trajectory vectors, conflict lines,
  * communication links, obstacles, uncertainty regions, destination markers,
  * avoidance waypoints, sky dome, stars, sun, and a textured ground plane.
+ * Supports day/night mode toggle and conflict-line visibility toggle.
  */
 
 import * as THREE from "three";
@@ -15,6 +16,13 @@ const COMM_LINE_COLOR = 0x336688;
 const STALE_LINE_COLOR = 0x995533;
 const CONFLICT_COLOR = 0xff2222;
 const WAYPOINT_COLOR = 0xffaa44;
+
+const NIGHT_SKY = { top: 0x071030, mid: 0x1a3050, bottom: 0x0e1818 };
+const DAY_SKY = { top: 0x2277cc, mid: 0x66bbee, bottom: 0xcceeff };
+const NIGHT_CLEAR = 0x0a0a1a;
+const DAY_CLEAR = 0x87ceeb;
+const NIGHT_FOG_DENSITY = 0.000022;
+const DAY_FOG_DENSITY = 0.000012;
 
 // Sim (x, y, z_alt) → Three (x, z_alt, y)
 function toThree(pos: [number, number, number]): THREE.Vector3 {
@@ -71,35 +79,65 @@ function makeSunTexture(): THREE.CanvasTexture {
   return new THREE.CanvasTexture(canvas);
 }
 
-function makeGroundTexture(): THREE.CanvasTexture {
+function makeGroundTexture(day: boolean): THREE.CanvasTexture {
   const size = 512;
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#0e1f14";
-  ctx.fillRect(0, 0, size, size);
-  for (let i = 0; i < 50; i++) {
-    const x = Math.random() * size;
-    const y = Math.random() * size;
-    const w = 20 + Math.random() * 60;
-    const h = 20 + Math.random() * 60;
-    ctx.globalAlpha = 0.3 + Math.random() * 0.3;
-    ctx.fillStyle = `rgb(${10 + Math.floor(Math.random() * 18)},${22 + Math.floor(Math.random() * 22)},${8 + Math.floor(Math.random() * 14)})`;
-    ctx.fillRect(x, y, w, h);
+
+  if (day) {
+    ctx.fillStyle = "#4a8c3f";
+    ctx.fillRect(0, 0, size, size);
+    for (let i = 0; i < 60; i++) {
+      const x = Math.random() * size;
+      const y = Math.random() * size;
+      const w = 20 + Math.random() * 70;
+      const h = 20 + Math.random() * 70;
+      ctx.globalAlpha = 0.15 + Math.random() * 0.25;
+      const g = 110 + Math.floor(Math.random() * 50);
+      ctx.fillStyle = `rgb(${40 + Math.floor(Math.random() * 30)},${g},${30 + Math.floor(Math.random() * 20)})`;
+      ctx.fillRect(x, y, w, h);
+    }
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "rgba(90,70,50,0.15)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 6; i++) {
+      ctx.beginPath();
+      ctx.moveTo(Math.random() * size, 0);
+      ctx.lineTo(Math.random() * size, size);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, Math.random() * size);
+      ctx.lineTo(size, Math.random() * size);
+      ctx.stroke();
+    }
+  } else {
+    ctx.fillStyle = "#0e1f14";
+    ctx.fillRect(0, 0, size, size);
+    for (let i = 0; i < 50; i++) {
+      const x = Math.random() * size;
+      const y = Math.random() * size;
+      const w = 20 + Math.random() * 60;
+      const h = 20 + Math.random() * 60;
+      ctx.globalAlpha = 0.3 + Math.random() * 0.3;
+      ctx.fillStyle = `rgb(${10 + Math.floor(Math.random() * 18)},${22 + Math.floor(Math.random() * 22)},${8 + Math.floor(Math.random() * 14)})`;
+      ctx.fillRect(x, y, w, h);
+    }
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "rgba(55,75,45,0.25)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(Math.random() * size, 0);
+      ctx.lineTo(Math.random() * size, size);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, Math.random() * size);
+      ctx.lineTo(size, Math.random() * size);
+      ctx.stroke();
+    }
   }
-  ctx.globalAlpha = 1;
-  ctx.strokeStyle = "rgba(55,75,45,0.25)";
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 4; i++) {
-    ctx.beginPath();
-    ctx.moveTo(Math.random() * size, 0);
-    ctx.lineTo(Math.random() * size, size);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(0, Math.random() * size);
-    ctx.lineTo(size, Math.random() * size);
-    ctx.stroke();
-  }
+
   return new THREE.CanvasTexture(canvas);
 }
 
@@ -265,6 +303,11 @@ class AircraftVisual {
 
 // ────── SkyScene ──────
 
+export interface ViewOptions {
+  dayMode: boolean;
+  showConflicts: boolean;
+}
+
 export class SkyScene {
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
@@ -280,8 +323,14 @@ export class SkyScene {
   uncertainMeshes: Map<string, THREE.Mesh> = new Map();
 
   boundsGroup: THREE.Group;
-  skyDone = false;
-  groundDone = false;
+  skyMesh: THREE.Mesh | null = null;
+  skyStarField: THREE.Points | null = null;
+  skySun: THREE.Sprite | null = null;
+  groundMesh: THREE.Mesh | null = null;
+
+  private lastSnapshot: SimSnapshot | null = null;
+
+  viewOptions: ViewOptions = { dayMode: false, showConflicts: true };
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -291,11 +340,11 @@ export class SkyScene {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setSize(w, h);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor(0x0a0a1a);
+    this.renderer.setClearColor(NIGHT_CLEAR);
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(0x0a0a1a, 0.000022);
+    this.scene.fog = new THREE.FogExp2(NIGHT_CLEAR, NIGHT_FOG_DENSITY);
 
     this.camera = new THREE.PerspectiveCamera(55, w / h, 50, 120000);
     this.camera.position.set(6000, 9000, 18000);
@@ -322,60 +371,75 @@ export class SkyScene {
     this.animate();
   }
 
-  private animate = () => {
-    requestAnimationFrame(this.animate);
-    this.controls.update();
-    this.renderer.render(this.scene, this.camera);
-  };
+  setOptions(opts: Partial<ViewOptions>) {
+    const prev = { ...this.viewOptions };
+    if (opts.dayMode !== undefined) this.viewOptions.dayMode = opts.dayMode;
+    if (opts.showConflicts !== undefined) this.viewOptions.showConflicts = opts.showConflicts;
 
-  private onResize = () => {
-    const w = this.container.clientWidth;
-    const h = this.container.clientHeight;
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-    this.renderer.setSize(w, h);
-  };
+    if (prev.dayMode !== this.viewOptions.dayMode) {
+      this.rebuildEnvironment();
+    }
 
-  update(snapshot: SimSnapshot) {
-    const { width, depth, floor, ceiling } = snapshot.airspace;
-    this.updateBounds(width, depth, floor, ceiling);
-    this.updateSky(width, depth, ceiling);
-    this.updateGround(width, depth, floor);
-    this.updateObstacles(snapshot.airspace.obstacles);
-    this.updateAircraft(snapshot.aircraft);
-    this.updateConflicts(snapshot.aircraft);
-    this.updateNeighborLines(snapshot.aircraft);
-    this.updateUncertainty(snapshot);
-    this.updateDestMarkers(snapshot.aircraft);
+    if (prev.showConflicts !== this.viewOptions.showConflicts) {
+      if (!this.viewOptions.showConflicts) {
+        this.conflictLines.forEach((l) => this.scene.remove(l));
+        this.conflictLines = [];
+      } else if (this.lastSnapshot) {
+        this.updateConflicts(this.lastSnapshot.aircraft);
+      }
+    }
   }
 
-  private updateBounds(width: number, depth: number, floor: number, ceiling: number) {
-    if (this.boundsGroup.children.length > 0) return;
-    const grid = new THREE.GridHelper(Math.max(width, depth), 30, 0x222244, 0x111133);
-    grid.position.set(width / 2, floor, depth / 2);
-    this.boundsGroup.add(grid);
-    const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(width, ceiling - floor, depth));
-    const box = new THREE.LineSegments(
-      edges,
-      new THREE.LineBasicMaterial({ color: 0x334466, opacity: 0.2, transparent: true }),
-    );
-    box.position.set(width / 2, (floor + ceiling) / 2, depth / 2);
-    this.boundsGroup.add(box);
+  private rebuildEnvironment() {
+    const day = this.viewOptions.dayMode;
+    const clearColor = day ? DAY_CLEAR : NIGHT_CLEAR;
+
+    this.renderer.setClearColor(clearColor);
+    (this.scene.fog as THREE.FogExp2).color.setHex(clearColor);
+    (this.scene.fog as THREE.FogExp2).density = day ? DAY_FOG_DENSITY : NIGHT_FOG_DENSITY;
+
+    this.rebuildBounds();
+    this.rebuildSky();
+    this.rebuildGround();
   }
 
-  private updateSky(width: number, depth: number, ceiling: number) {
-    if (this.skyDone) return;
-    this.skyDone = true;
+  private rebuildSky() {
+    if (this.skyMesh) {
+      this.scene.remove(this.skyMesh);
+      (this.skyMesh.material as THREE.ShaderMaterial).dispose();
+      this.skyMesh.geometry.dispose();
+      this.skyMesh = null;
+    }
+    if (this.skyStarField) {
+      this.scene.remove(this.skyStarField);
+      this.skyStarField.geometry.dispose();
+      (this.skyStarField.material as THREE.Material).dispose();
+      this.skyStarField = null;
+    }
+    if (this.skySun) {
+      this.scene.remove(this.skySun);
+      (this.skySun.material as THREE.Material).dispose();
+      this.skySun = null;
+    }
+
+    const day = this.viewOptions.dayMode;
+    const colors = day ? DAY_SKY : NIGHT_SKY;
+
+    const air = this.lastSnapshot?.airspace ?? { width: 15000, depth: 15000, ceiling: 5000 };
+    const w = air.width;
+    const d = air.depth;
+    const ceiling = air.ceiling;
     const radius = 55000;
+
     const geo = new THREE.SphereGeometry(radius, 28, 18);
     const mat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
       fog: false,
       uniforms: {
-        topColor: { value: new THREE.Color(0x071030) },
-        midColor: { value: new THREE.Color(0x1a3050) },
-        bottomColor: { value: new THREE.Color(0x0e1818) },
+        topColor: { value: new THREE.Color(colors.top) },
+        midColor: { value: new THREE.Color(colors.mid) },
+        bottomColor: { value: new THREE.Color(colors.bottom) },
       },
       vertexShader: `
         varying vec3 vWorldPos;
@@ -398,64 +462,153 @@ export class SkyScene {
       `,
     });
     const sky = new THREE.Mesh(geo, mat);
-    sky.position.set(width / 2, ceiling / 2, depth / 2);
+    sky.position.set(w / 2, ceiling / 2, d / 2);
     this.scene.add(sky);
+    this.skyMesh = sky;
 
-    // stars
-    const verts: number[] = [];
-    for (let i = 0; i < 500; i++) {
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.acos(Math.random() * 0.85 + 0.15);
-      const r = radius * 0.95;
-      verts.push(
-        r * Math.sin(phi) * Math.cos(theta) + width / 2,
-        r * Math.cos(phi) + ceiling / 2,
-        r * Math.sin(phi) * Math.sin(theta) + depth / 2,
-      );
-    }
-    const starGeo = new THREE.BufferGeometry();
-    starGeo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
-    this.scene.add(
-      new THREE.Points(
+    if (!day) {
+      const verts: number[] = [];
+      for (let i = 0; i < 500; i++) {
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(Math.random() * 0.85 + 0.15);
+        const r = radius * 0.95;
+        verts.push(
+          r * Math.sin(phi) * Math.cos(theta) + w / 2,
+          r * Math.cos(phi) + ceiling / 2,
+          r * Math.sin(phi) * Math.sin(theta) + d / 2,
+        );
+      }
+      const starGeo = new THREE.BufferGeometry();
+      starGeo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+      const stars = new THREE.Points(
         starGeo,
         new THREE.PointsMaterial({ color: 0xaabbee, size: 45, sizeAttenuation: true, fog: false }),
-      ),
-    );
+      );
+      this.scene.add(stars);
+      this.skyStarField = stars;
+    }
 
-    // sun sprite
     const sun = new THREE.Sprite(
       new THREE.SpriteMaterial({
         map: makeSunTexture(),
-        color: 0xffffee,
+        color: day ? 0xffffff : 0xffffee,
         fog: false,
         transparent: true,
-        opacity: 0.85,
+        opacity: day ? 1.0 : 0.85,
       }),
     );
-    sun.position.set(width * 1.5, ceiling * 3, depth * 0.5);
-    sun.scale.set(6000, 6000, 1);
+    sun.position.set(w * 1.5, ceiling * 3, d * 0.5);
+    const sunScale = day ? 8000 : 6000;
+    sun.scale.set(sunScale, sunScale, 1);
     this.scene.add(sun);
+    this.skySun = sun;
   }
 
-  private updateGround(width: number, depth: number, floor: number) {
-    if (this.groundDone) return;
-    this.groundDone = true;
+  private rebuildGround() {
+    if (this.groundMesh) {
+      this.scene.remove(this.groundMesh);
+      (this.groundMesh.material as THREE.MeshLambertMaterial).map?.dispose();
+      (this.groundMesh.material as THREE.Material).dispose();
+      this.groundMesh.geometry.dispose();
+      this.groundMesh = null;
+    }
+
+    const day = this.viewOptions.dayMode;
+    const width = this.lastSnapshot?.airspace.width ?? 15000;
+    const depth = this.lastSnapshot?.airspace.depth ?? 15000;
+    const floor = this.lastSnapshot?.airspace.floor ?? 100;
     const size = Math.max(width, depth) * 1.6;
     const geo = new THREE.PlaneGeometry(size, size);
     geo.rotateX(-Math.PI / 2);
     const mat = new THREE.MeshLambertMaterial({
-      map: makeGroundTexture(),
+      map: makeGroundTexture(day),
       side: THREE.DoubleSide,
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(width / 2, floor - 80, depth / 2);
     this.scene.add(mesh);
+    this.groundMesh = mesh;
+  }
+
+  private animate = () => {
+    requestAnimationFrame(this.animate);
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  };
+
+  private onResize = () => {
+    const w = this.container.clientWidth;
+    const h = this.container.clientHeight;
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h);
+  };
+
+  update(snapshot: SimSnapshot) {
+    this.lastSnapshot = snapshot;
+    const { width, depth, floor, ceiling } = snapshot.airspace;
+    this.updateBounds(width, depth, floor, ceiling);
+    this.updateSkyIfNeeded();
+    this.updateGroundIfNeeded();
+    this.updateObstacles(snapshot.airspace.obstacles);
+    this.updateAircraft(snapshot.aircraft);
+    this.updateConflicts(snapshot.aircraft);
+    this.updateNeighborLines(snapshot.aircraft);
+    this.updateUncertainty(snapshot);
+    this.updateDestMarkers(snapshot.aircraft);
+  }
+
+  private updateBounds(width: number, depth: number, floor: number, ceiling: number) {
+    if (this.boundsGroup.userData.boundsBuilt) return;
+    this.boundsGroup.userData.boundsBuilt = true;
+    const day = this.viewOptions.dayMode;
+    const gridColor1 = day ? 0x88aaaa : 0x222244;
+    const gridColor2 = day ? 0x667777 : 0x111133;
+    const grid = new THREE.GridHelper(Math.max(width, depth), 30, gridColor1, gridColor2);
+    grid.position.set(width / 2, floor, depth / 2);
+    this.boundsGroup.add(grid);
+    const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(width, ceiling - floor, depth));
+    const boxColor = day ? 0x558888 : 0x334466;
+    const box = new THREE.LineSegments(
+      edges,
+      new THREE.LineBasicMaterial({ color: boxColor, opacity: 0.2, transparent: true }),
+    );
+    box.position.set(width / 2, (floor + ceiling) / 2, depth / 2);
+    this.boundsGroup.add(box);
+  }
+
+  private rebuildBounds() {
+    for (const child of [...this.boundsGroup.children]) {
+      if (child instanceof THREE.LineSegments || child instanceof THREE.GridHelper) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+      this.boundsGroup.remove(child);
+    }
+    this.boundsGroup.userData.boundsBuilt = false;
+    const air = this.lastSnapshot?.airspace;
+    if (air) {
+      this.updateBounds(air.width, air.depth, air.floor, air.ceiling);
+    }
+  }
+
+  private updateSkyIfNeeded() {
+    if (!this.skyMesh) {
+      this.rebuildSky();
+    }
+  }
+
+  private updateGroundIfNeeded() {
+    if (!this.groundMesh) {
+      this.rebuildGround();
+    }
   }
 
   private updateObstacles(
     obstacles: { id: string; kind: string; center: [number, number, number]; radius: number; height: number }[],
   ) {
     const incoming = new Set(obstacles.map((o) => o.id));
+    const day = this.viewOptions.dayMode;
 
     for (const obs of obstacles) {
       if (this.obstacleGroups.has(obs.id)) continue;
@@ -463,23 +616,26 @@ export class SkyScene {
       const pos3 = toThree(obs.center);
 
       if (obs.kind === "AIRPORT") {
+        const padColor = day ? 0x555555 : 0x1a2a1a;
         const pad = new THREE.Mesh(
           new THREE.CylinderGeometry(obs.radius * 0.55, obs.radius * 0.55, 40, 28),
-          new THREE.MeshPhongMaterial({ color: 0x1a2a1a, opacity: 0.5, transparent: true }),
+          new THREE.MeshPhongMaterial({ color: padColor, opacity: 0.7, transparent: true }),
         );
         pad.position.copy(pos3).setY(pos3.y - obs.height * 0.35);
         group.add(pad);
         const rLen = obs.radius * 1.2;
+        const rwyColor = day ? 0xeeeeee : 0xccccee;
         for (const angle of [0, Math.PI / 2]) {
           const rwy = new THREE.Mesh(
             new THREE.BoxGeometry(rLen, 6, 18),
-            new THREE.MeshPhongMaterial({ color: 0xccccee, opacity: 0.6, transparent: true }),
+            new THREE.MeshPhongMaterial({ color: rwyColor, opacity: 0.8, transparent: true }),
           );
           rwy.position.copy(pos3).setY(pos3.y - obs.height * 0.34);
           rwy.rotation.y = angle;
           group.add(rwy);
         }
-        const label = makeTextSprite("AIRPORT", 0xccddcc);
+        const labelColor = day ? 0x224422 : 0xccddcc;
+        const label = makeTextSprite("AIRPORT", labelColor);
         label.position.copy(pos3).setY(pos3.y - obs.height * 0.2);
         label.scale.set(400, 150, 1);
         group.add(label);
@@ -569,6 +725,9 @@ export class SkyScene {
   private updateConflicts(aircraft: AircraftSnapshot[]) {
     this.conflictLines.forEach((l) => this.scene.remove(l));
     this.conflictLines = [];
+
+    if (!this.viewOptions.showConflicts) return;
+
     const drawn = new Set<string>();
     for (const ac of aircraft) {
       for (const otherId of ac.conflict_with) {

@@ -10,6 +10,8 @@ export default function App() {
   const { snapshot, connected } = useSimulationSocket();
 
   const [sceneReady, setSceneReady] = useState(false);
+  const [dayMode, setDayMode] = useState(false);
+  const [showConflicts, setShowConflicts] = useState(true);
 
   useEffect(() => {
     if (!containerRef.current || sceneRef.current) return;
@@ -20,6 +22,10 @@ export default function App() {
       sceneRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    sceneRef.current?.setOptions({ dayMode, showConflicts });
+  }, [dayMode, showConflicts]);
 
   useEffect(() => {
     if (snapshot && sceneRef.current) {
@@ -36,12 +42,14 @@ export default function App() {
           position: "absolute",
           top: 12,
           right: 12,
-          padding: "2px 10px",
-          borderRadius: 20,
-          font: "11px/2 monospace",
-          color: connected ? "#7dffb0" : "#ff8899",
-          background: "#0a0e1c88",
-          border: `1px solid ${connected ? "#1f7a44" : "#7a2430"}`,
+          padding: "3px 12px",
+          borderRadius: 3,
+          font: "11px/1.6 'Consolas', 'Courier New', monospace",
+          letterSpacing: "1px",
+          color: connected ? "#33ff88" : "#ff6644",
+          background: "#0c1218cc",
+          border: `1px solid ${connected ? "#1a5a3a" : "#5a2218"}`,
+          textTransform: "uppercase",
         }}
       >
         {connected ? "● LIVE" : "○ RECONNECTING"}
@@ -49,7 +57,13 @@ export default function App() {
 
       {sceneReady && (
         <>
-          <Dashboard snapshot={snapshot} />
+          <Dashboard
+            snapshot={snapshot}
+            dayMode={dayMode}
+            setDayMode={setDayMode}
+            showConflicts={showConflicts}
+            setShowConflicts={setShowConflicts}
+          />
           <ControlPanel />
         </>
       )}
