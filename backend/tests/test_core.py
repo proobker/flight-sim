@@ -153,3 +153,68 @@ def test_aircraft_avoids_obstacle_via_waypoint():
         d = math.hypot(ac.position[0], ac.position[1] - 2500.0)
         min_dist = min(min_dist, d)
     assert min_dist >= 1000.0 + 300.0 - 80.0
+
+
+def test_airports_defaulted_to_six_open_fields():
+    airspace = Airspace()
+    assert len(airspace.airports) == 6
+    assert all(not a.closed for a in airspace.airports)
+    assert airspace.snapshot()["airports"][0]["name"]
+
+
+def test_random_airport_excludes_closed_and_self():
+    airspace = Airspace()
+    airspace.airports[0].closed = True
+    for _ in range(50):
+        picked = airspace.random_airport()
+        assert picked.aid != airspace.airports[0].aid
+
+    first = airspace.random_airport(exclude_id="APT1")
+    assert first.aid != "APT1"
+
+
+def test_close_airport_marks_one_closed():
+    airspace = Airspace()
+    closed = airspace.close_airport()
+    assert closed is not None
+    assert closed.closed is True
+    assert sum(1 for a in airspace.airports if a.closed) == 1
+
+
+def test_aircraft_descends_into_low_airport_nearby():
+    ac = Aircraft(
+        aircraft_id="L1",
+        position=(1000.0, 1000.0, 2000.0),
+        destination=(1200.0, 1000.0, 140.0),
+        speed=100.0,
+        heading=0.0,
+        cruise_altitude=2000.0,
+    )
+    v = ac.steer_velocity()
+    assert v[2] < 0.0, "should descend into a nearby low destination"
+
+
+def test_aircraft_holds_cruise_when_far_from_airport():
+    ac = Aircraft(
+        aircraft_id="L2",
+        position=(1000.0, 1000.0, 2000.0),
+        destination=(9000.0, 9000.0, 140.0),
+        speed=100.0,
+        heading=0.0,
+        cruise_altitude=2000.0,
+    )
+    v = ac.steer_velocity()
+    assert v[2] == pytest.approx(0.0, abs=25.0), "cruises at altitude far from the airport"
+
+
+def test_aircraft_descends_without_waypoint_only():
+    ac = Aircraft(
+        aircraft_id="L3",
+        position=(1000.0, 1000.0, 2000.0),
+        destination=(1100.0, 1000.0, 140.0),
+        speed=100.0,
+        heading=0.0,
+        cruise_altitude=2000.0,
+    )
+    ac.waypoint = (5000.0, 5000.0, 2000.0)
+    assert ac.steer_velocity()[2] >= -25.0, "avoidance waypoint overrides descent"

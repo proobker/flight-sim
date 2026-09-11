@@ -85,10 +85,12 @@ class Simulator:
     async def _spawn_aircraft(self, count: int) -> None:
         for _ in range(count):
             aid = f"A{next(self._next_id):03d}"
-            pos = self.airspace.random_point(self._rng)
-            dest = self.airspace.random_point(self._rng)
+            start = self.airspace.random_airport(self._rng)
+            dest_airport = self.airspace.random_airport(self._rng, exclude_id=start.aid)
+            pos = self._runway_spot(start)
+            dest = dest_airport.position
             speed = self._rng.uniform(*self.config.speed_range)
-            heading = self._rng.uniform(0, math.pi * 2)
+            heading = math.atan2(dest[0] - pos[0], dest[1] - pos[1])
             ac = Aircraft(
                 aircraft_id=aid,
                 position=pos,
@@ -122,10 +124,19 @@ class Simulator:
             self.node_ids[aid] = node
             self._spawned += 1
 
+    def _runway_spot(self, airport) -> tuple[float, float, float]:
+        """A takeoff position near the airport pad — slightly offset so aircraft fan out."""
+        r = airport.radius * 0.55
+        angle = self._rng.uniform(0.0, math.pi * 2)
+        x = airport.position[0] + math.cos(angle) * r * self._rng.uniform(0.4, 1.0)
+        y = airport.position[1] + math.sin(angle) * r * self._rng.uniform(0.4, 1.0)
+        z = airport.position[2] + self._rng.uniform(0.0, 60.0)
+        return (x, y, z)
+
     async def spawn_emergency(self) -> AircraftAgent:
         aid = f"E{next(self._next_id):03d}"
         pos = self.airspace.random_point(self._rng, self.config.cruise_altitude)
-        dest = self.airspace.random_point(self._rng)
+        dest = self.airspace.random_airport(self._rng).position
         ac = Aircraft(
             aircraft_id=aid,
             position=pos,
@@ -222,9 +233,7 @@ class Simulator:
         self.airspace.add_obstacle("STORM", center, 1500.0, 4000.0)
 
     def close_airport(self) -> None:
-        cx = self._rng.uniform(self.airspace.width * 0.2, self.airspace.width * 0.8)
-        cy = self._rng.uniform(self.airspace.depth * 0.2, self.airspace.depth * 0.8)
-        self.airspace.add_obstacle("AIRPORT", (cx, cy, self.config.cruise_altitude), 2000.0, 3000.0)
+        self.airspace.close_airport()
 
     async def add_nofly(self, center=None) -> None:
         if center is None:

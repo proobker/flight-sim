@@ -311,7 +311,7 @@ class AircraftAgent:
             else:
                 self.aircraft.waypoint = None
         if self.aircraft.reached_destination() and self.aircraft.plan is None:
-            self.aircraft.destination = self.airspace.random_point(random, self.aircraft.cruise_altitude)
+            self.aircraft.destination = self.airspace.next_destination()
 
         if self.tick % self.broadcast_every == 0:
             self._broadcast_state(now)

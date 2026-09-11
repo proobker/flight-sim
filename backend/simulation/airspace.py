@@ -1,10 +1,34 @@
-"""Airspace world model — bounds and dynamic hazards (no-fly zones, storms)."""
+"""Airspace world model — bounds, airports, and dynamic hazards (no-fly zones, storms)."""
 
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Any
+
+
+AIRPORT_NAMES = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"]
+
+
+@dataclass
+class Airport:
+    """A landing field aircraft spawn from and fly to."""
+
+    aid: str
+    name: str
+    position: tuple[float, float, float]
+    radius: float = 1200.0
+    closed: bool = False
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.aid,
+            "name": self.name,
+            "center": list(self.position),
+            "radius": self.radius,
+            "closed": self.closed,
+        }
 
 
 @dataclass
@@ -44,13 +68,65 @@ class Airspace:
         depth: float = 20000.0,
         floor: float = 100.0,
         ceiling: float = 6000.0,
+        airports: list[Airport] | None = None,
     ) -> None:
         self.width = width
         self.depth = depth
         self.floor = floor
         self.ceiling = ceiling
         self.obstacles: list[Obstacle] = []
+        self.airports: list[Airport] = airports if airports is not None else self._default_airports()
         self._next_obs = 0
+
+    def _default_airports(self) -> list[Airport]:
+        """Six strings spread around the field: four corners plus two edge midpoints."""
+        w, d = self.width, self.depth
+        fh = 0.10
+        spots = [
+            (w * fh, d * fh),
+            (w * (1 - fh), d * fh),
+            (w * fh, d * (1 - fh)),
+            (w * (1 - fh), d * (1 - fh)),
+            (w * 0.5, d * 0.06),
+            (w * 0.5, d * 0.94),
+        ]
+        pads: list[Airport] = []
+        for i, (x, y) in enumerate(spots):
+            pads.append(
+                Airport(
+                    aid=f"APT{i + 1}",
+                    name=AIRPORT_NAMES[i],
+                    position=(x, y, self.floor + 40.0),
+                    radius=1200.0,
+                )
+            )
+        return pads
+
+    def random_airport(self, rng=None, exclude_id: str | None = None) -> Airport:
+        rng = rng or random
+        candidates = [a for a in self.airports if not a.closed and a.aid != exclude_id]
+        if not candidates:
+            candidates = [a for a in self.airports if a.aid != exclude_id] or self.airports
+        return rng.choice(candidates)
+
+    def airport_by_id(self, aid: str) -> Airport | None:
+        for a in self.airports:
+            if a.aid == aid:
+                return a
+        return None
+
+    def next_destination(self, exclude_id: str | None = None) -> tuple[float, float, float]:
+        return self.random_airport(exclude_id=exclude_id).position
+
+    def close_airport(self, aid: str | None = None):
+        open_ports = [a for a in self.airports if not a.closed]
+        if not open_ports:
+            return None
+        target = self.airport_by_id(aid) if aid else random.choice(open_ports)
+        if target is None:
+            return None
+        target.closed = True
+        return target
 
     def center(self) -> tuple[float, float, float]:
         return (self.width / 2, self.depth / 2, (self.ceiling + self.floor) / 2)
@@ -143,6 +219,7 @@ class Airspace:
             "depth": self.depth,
             "floor": self.floor,
             "ceiling": self.ceiling,
+            "airports": [a.snapshot() for a in self.airports],
             "obstacles": [o.snapshot() for o in self.obstacles if o.active],
         }
 

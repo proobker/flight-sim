@@ -9,11 +9,20 @@ export interface Obstacle {
   active: boolean;
 }
 
+export interface Airport {
+  id: string;
+  name: string;
+  center: [number, number, number];
+  radius: number;
+  closed: boolean;
+}
+
 export interface AirspaceSnapshot {
   width: number;
   depth: number;
   floor: number;
   ceiling: number;
+  airports: Airport[];
   obstacles: Obstacle[];
 }
 
@@ -40,6 +49,7 @@ export interface AircraftSnapshot {
   waypoint: [number, number, number] | null;
   plan: [[number, number, number], number, number] | null;
   maneuvering: boolean;
+  landing: boolean;
   distance: number;
   fuel: number;
   neighbors: NeighborInfo[];

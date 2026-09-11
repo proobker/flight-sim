@@ -53,12 +53,14 @@ export function Dashboard({
   setDayMode,
   showConflicts,
   setShowConflicts,
+  onReset,
 }: {
   snapshot: SimSnapshot | null;
   dayMode: boolean;
   setDayMode: (v: boolean) => void;
   showConflicts: boolean;
   setShowConflicts: (v: boolean) => void;
+  onReset: () => void;
 }) {
   if (!snapshot) {
     return (
@@ -110,6 +112,25 @@ export function Dashboard({
             <div style={toggleKnob(showConflicts)} />
           </div>
         </div>
+        <button
+          onClick={onReset}
+          style={{
+            width: "100%",
+            marginTop: 6,
+            padding: "5px 0",
+            background: "#0c1218",
+            color: "#668888",
+            border: "1px solid #1a3a2a",
+            borderRadius: 3,
+            cursor: "pointer",
+            fontFamily: "'Consolas', 'Courier New', monospace",
+            fontSize: 10,
+            letterSpacing: "2px",
+            transition: "all 0.15s ease",
+          }}
+        >
+          RESET
+        </button>
       </div>
     </div>
   );

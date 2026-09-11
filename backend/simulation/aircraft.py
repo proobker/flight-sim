@@ -46,6 +46,8 @@ class Aircraft:
         turn_rate: float = 0.30,
         maneuver_duration: float = 3.0,
         cooldown: float = 2.0,
+        approach_radius: float = 4000.0,
+        approach_altitude_offset: float = 60.0,
     ) -> None:
         self.id = aircraft_id
         self.position = position
@@ -60,6 +62,8 @@ class Aircraft:
         self.turn_rate = turn_rate
         self.maneuver_duration = maneuver_duration
         self.cooldown_duration = cooldown
+        self.approach_radius = approach_radius
+        self.approach_altitude_offset = approach_altitude_offset
 
         self.heading = heading
         self.active = True
@@ -100,7 +104,15 @@ class Aircraft:
         dy = target[1] - self.position[1]
         desired = math.atan2(dx, dy)
         delta = _towards(self.heading, desired, self.turn_rate)
-        target_z = physics.clamp_altitude(self.cruise_altitude, self.min_altitude, self.max_altitude)
+
+        # Vertical profile: hold cruise altitude, but run a real landing
+        # approach (descend toward the runway) once we are closing on a
+        # low-altitude destination such as an airport.
+        target_z = self.cruise_altitude
+        if self.waypoint is None and self.destination[2] < self.cruise_altitude - 200.0:
+            if physics.h_distance(self.position, self.destination) < self.approach_radius:
+                target_z = self.destination[2] + self.approach_altitude_offset
+        target_z = physics.clamp_altitude(target_z, self.min_altitude, self.max_altitude)
         vz = physics.clamp_altitude(target_z - self.position[2], -self.climb_rate, self.climb_rate)
         return physics.to_velocity(self.heading + delta, self.speed, vz)
 
@@ -146,6 +158,14 @@ class Aircraft:
     def reached_destination(self, threshold: float = 80.0) -> bool:
         return physics.h_distance(self.position, self.destination) < threshold
 
+    def is_landing(self) -> bool:
+        if self.plan is not None or self.waypoint is not None:
+            return False
+        return (
+            self.destination[2] < self.cruise_altitude - 200.0
+            and physics.h_distance(self.position, self.destination) < self.approach_radius
+        )
+
     def waypoint_reached(self, threshold: float = 250.0) -> bool:
         return self.waypoint is None or physics.h_distance(self.position, self.waypoint) < threshold
 
@@ -176,6 +196,7 @@ class Aircraft:
                 else None
             ),
             "maneuvering": self.plan is not None and self.plan.duration > 0,
+            "landing": self.is_landing(),
             "distance": self.distance_travelled,
             "fuel": self.fuel_used,
         }

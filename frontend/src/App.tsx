@@ -33,6 +33,12 @@ export default function App() {
     }
   }, [snapshot]);
 
+  const handleReset = () => {
+    setDayMode(false);
+    setShowConflicts(true);
+    sceneRef.current?.resetView();
+  };
+
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative", overflow: "hidden" }}>
       <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
@@ -63,6 +69,7 @@ export default function App() {
             setDayMode={setDayMode}
             showConflicts={showConflicts}
             setShowConflicts={setShowConflicts}
+            onReset={handleReset}
           />
           <ControlPanel />
         </>

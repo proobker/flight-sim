@@ -3,13 +3,14 @@
  *
  * Renders airplane markers, predicted trajectory vectors, conflict lines,
  * communication links, obstacles, uncertainty regions, destination markers,
- * avoidance waypoints, sky dome, stars, sun, and a textured ground plane.
+ * avoidance waypoints, an infinite tiled ground, rolling terrain, airports,
+ * sky dome, stars, sun, and a textured ground plane.
  * Supports day/night mode toggle and conflict-line visibility toggle.
  */
 
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { SimSnapshot, AircraftSnapshot } from "../api/types";
+import type { SimSnapshot, AircraftSnapshot, Airport } from "../api/types";
 
 const PRIORITY_COLORS = [0xaaddff, 0xffaa44, 0x44dd88, 0xffdd44, 0xff4444];
 const COMM_LINE_COLOR = 0x336688;
@@ -24,9 +25,26 @@ const DAY_CLEAR = 0x87ceeb;
 const NIGHT_FOG_DENSITY = 0.000022;
 const DAY_FOG_DENSITY = 0.000012;
 
+// The ground extends far beyond the sky dome and fog so its edge is never
+// visible — the world reads as endless.
+const GROUND_HALF_EXTENT = 160000;
+const GROUND_CLEARANCE = 80;
+
 // Sim (x, y, z_alt) → Three (x, z_alt, y)
 function toThree(pos: [number, number, number]): THREE.Vector3 {
   return new THREE.Vector3(pos[0], pos[2], pos[1]);
+}
+
+// Deterministic PRNG so terrain is identical on every rebuild.
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 // ────── shared airplane geometries (created once, rotated once) ──────
@@ -79,66 +97,65 @@ function makeSunTexture(): THREE.CanvasTexture {
   return new THREE.CanvasTexture(canvas);
 }
 
+/**
+ * A ground texture drawn as a torus (every patch is stamped at ±size offsets)
+ * so it repeats seamlessly — required for the infinite ground plane.
+ */
 function makeGroundTexture(day: boolean): THREE.CanvasTexture {
   const size = 512;
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d")!;
 
-  if (day) {
-    ctx.fillStyle = "#4a8c3f";
-    ctx.fillRect(0, 0, size, size);
-    for (let i = 0; i < 60; i++) {
-      const x = Math.random() * size;
-      const y = Math.random() * size;
-      const w = 20 + Math.random() * 70;
-      const h = 20 + Math.random() * 70;
-      ctx.globalAlpha = 0.15 + Math.random() * 0.25;
+  ctx.fillStyle = day ? "#4a8c3f" : "#0e1f14";
+  ctx.fillRect(0, 0, size, size);
+
+  const patchCount = day ? 60 : 50;
+  for (let i = 0; i < patchCount; i++) {
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const w = 20 + Math.random() * 70;
+    const h = 20 + Math.random() * 70;
+    ctx.globalAlpha = 0.15 + Math.random() * 0.25;
+    if (day) {
       const g = 110 + Math.floor(Math.random() * 50);
       ctx.fillStyle = `rgb(${40 + Math.floor(Math.random() * 30)},${g},${30 + Math.floor(Math.random() * 20)})`;
-      ctx.fillRect(x, y, w, h);
-    }
-    ctx.globalAlpha = 1;
-    ctx.strokeStyle = "rgba(90,70,50,0.15)";
-    ctx.lineWidth = 1;
-    for (let i = 0; i < 6; i++) {
-      ctx.beginPath();
-      ctx.moveTo(Math.random() * size, 0);
-      ctx.lineTo(Math.random() * size, size);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(0, Math.random() * size);
-      ctx.lineTo(size, Math.random() * size);
-      ctx.stroke();
-    }
-  } else {
-    ctx.fillStyle = "#0e1f14";
-    ctx.fillRect(0, 0, size, size);
-    for (let i = 0; i < 50; i++) {
-      const x = Math.random() * size;
-      const y = Math.random() * size;
-      const w = 20 + Math.random() * 60;
-      const h = 20 + Math.random() * 60;
-      ctx.globalAlpha = 0.3 + Math.random() * 0.3;
+    } else {
       ctx.fillStyle = `rgb(${10 + Math.floor(Math.random() * 18)},${22 + Math.floor(Math.random() * 22)},${8 + Math.floor(Math.random() * 14)})`;
-      ctx.fillRect(x, y, w, h);
     }
-    ctx.globalAlpha = 1;
-    ctx.strokeStyle = "rgba(55,75,45,0.25)";
-    ctx.lineWidth = 1;
-    for (let i = 0; i < 4; i++) {
-      ctx.beginPath();
-      ctx.moveTo(Math.random() * size, 0);
-      ctx.lineTo(Math.random() * size, size);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(0, Math.random() * size);
-      ctx.lineTo(size, Math.random() * size);
-      ctx.stroke();
+    for (const ox of [0, -size, size]) {
+      for (const oy of [0, -size, size]) {
+        ctx.fillRect(x + ox, y + oy, w, h);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  const lineCount = day ? 6 : 4;
+  ctx.strokeStyle = day ? "rgba(90,70,50,0.15)" : "rgba(55,75,45,0.25)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i < lineCount; i++) {
+    const x1 = Math.random() * size;
+    const x2 = Math.random() * size;
+    const y1 = Math.random() * size;
+    const y2 = Math.random() * size;
+    for (const ox of [0, -size, size]) {
+      for (const oy of [0, -size, size]) {
+        ctx.beginPath();
+        ctx.moveTo(x1 + ox, oy);
+        ctx.lineTo(x2 + ox, size + oy);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(ox, y1 + oy);
+        ctx.lineTo(size + ox, y2 + oy);
+        ctx.stroke();
+      }
     }
   }
 
-  return new THREE.CanvasTexture(canvas);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
 }
 
 function makeTextSprite(text: string, color: number): THREE.Sprite {
@@ -176,6 +193,14 @@ function makeDestMarker(color: number): THREE.Group {
   ring.position.y = 2;
   group.add(ring);
   return group;
+}
+
+// A material whose colour we can flip between day / night / closed.
+interface ThemedMat {
+  mat: THREE.MeshLambertMaterial | THREE.MeshPhongMaterial | THREE.SpriteMaterial;
+  day: number;
+  night: number;
+  closed?: number;
 }
 
 // ────── per-aircraft visual ──────
@@ -327,6 +352,11 @@ export class SkyScene {
   skyStarField: THREE.Points | null = null;
   skySun: THREE.Sprite | null = null;
   groundMesh: THREE.Mesh | null = null;
+  terrainGroup: THREE.Group | null = null;
+
+  private airportGroups: Map<string, THREE.Group> = new Map();
+  private airportThemes: Map<string, ThemedMat[]> = new Map();
+  private terrainThemes: ThemedMat[] = [];
 
   private lastSnapshot: SimSnapshot | null = null;
 
@@ -390,6 +420,12 @@ export class SkyScene {
     }
   }
 
+  resetView() {
+    this.camera.position.set(6000, 9000, 18000);
+    this.controls.target.set(7500, 1500, 7500);
+    this.controls.update();
+  }
+
   private rebuildEnvironment() {
     const day = this.viewOptions.dayMode;
     const clearColor = day ? DAY_CLEAR : NIGHT_CLEAR;
@@ -401,6 +437,8 @@ export class SkyScene {
     this.rebuildBounds();
     this.rebuildSky();
     this.rebuildGround();
+    this.applyTerrainTheme(day);
+    this.applyAirportTheme(day);
   }
 
   private rebuildSky() {
@@ -517,15 +555,19 @@ export class SkyScene {
     const width = this.lastSnapshot?.airspace.width ?? 15000;
     const depth = this.lastSnapshot?.airspace.depth ?? 15000;
     const floor = this.lastSnapshot?.airspace.floor ?? 100;
-    const size = Math.max(width, depth) * 1.6;
+
+    const size = GROUND_HALF_EXTENT * 2;
     const geo = new THREE.PlaneGeometry(size, size);
     geo.rotateX(-Math.PI / 2);
+    const tex = makeGroundTexture(day);
+    const tileMetres = 900;
+    tex.repeat.set(size / tileMetres, size / tileMetres);
     const mat = new THREE.MeshLambertMaterial({
-      map: makeGroundTexture(day),
+      map: tex,
       side: THREE.DoubleSide,
     });
     const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(width / 2, floor - 80, depth / 2);
+    mesh.position.set(width / 2, floor - GROUND_CLEARANCE, depth / 2);
     this.scene.add(mesh);
     this.groundMesh = mesh;
   }
@@ -550,6 +592,8 @@ export class SkyScene {
     this.updateBounds(width, depth, floor, ceiling);
     this.updateSkyIfNeeded();
     this.updateGroundIfNeeded();
+    this.ensureTerrain();
+    this.updateAirports(snapshot.airspace.airports);
     this.updateObstacles(snapshot.airspace.obstacles);
     this.updateAircraft(snapshot.aircraft);
     this.updateConflicts(snapshot.aircraft);
@@ -558,23 +602,18 @@ export class SkyScene {
     this.updateDestMarkers(snapshot.aircraft);
   }
 
-  private updateBounds(width: number, depth: number, floor: number, ceiling: number) {
+  private updateBounds(width: number, depth: number, floor: number, _ceiling: number) {
     if (this.boundsGroup.userData.boundsBuilt) return;
     this.boundsGroup.userData.boundsBuilt = true;
     const day = this.viewOptions.dayMode;
     const gridColor1 = day ? 0x88aaaa : 0x222244;
     const gridColor2 = day ? 0x667777 : 0x111133;
-    const grid = new THREE.GridHelper(Math.max(width, depth), 30, gridColor1, gridColor2);
+    const grid = new THREE.GridHelper(GROUND_HALF_EXTENT * 2, 640, gridColor1, gridColor2);
     grid.position.set(width / 2, floor, depth / 2);
+    const gridMat = grid.material as THREE.LineBasicMaterial;
+    gridMat.transparent = true;
+    gridMat.opacity = day ? 0.12 : 0.2;
     this.boundsGroup.add(grid);
-    const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(width, ceiling - floor, depth));
-    const boxColor = day ? 0x558888 : 0x334466;
-    const box = new THREE.LineSegments(
-      edges,
-      new THREE.LineBasicMaterial({ color: boxColor, opacity: 0.2, transparent: true }),
-    );
-    box.position.set(width / 2, (floor + ceiling) / 2, depth / 2);
-    this.boundsGroup.add(box);
   }
 
   private rebuildBounds() {
@@ -601,6 +640,222 @@ export class SkyScene {
   private updateGroundIfNeeded() {
     if (!this.groundMesh) {
       this.rebuildGround();
+    }
+  }
+
+  // ────── airports ──────
+
+  private updateAirports(airports: Airport[]) {
+    const incoming = new Set(airports.map((a) => a.id));
+    for (const apt of airports) {
+      const existing = this.airportGroups.get(apt.id);
+      if (existing && existing.userData.closed === apt.closed) continue;
+      if (existing) this.disposeAirport(apt.id);
+      this.buildAirport(apt);
+    }
+    for (const id of [...this.airportGroups.keys()]) {
+      if (!incoming.has(id)) this.disposeAirport(id);
+    }
+    this.applyAirportTheme(this.viewOptions.dayMode);
+  }
+
+  private buildAirport(apt: Airport) {
+    const air = this.lastSnapshot!.airspace;
+    const groundY = air.floor - GROUND_CLEARANCE;
+    const group = new THREE.Group();
+    const themes: ThemedMat[] = [];
+    const px = apt.center[0];
+    const pz = apt.center[1];
+
+    const padMat = new THREE.MeshPhongMaterial({ opacity: 0.85, transparent: true });
+    const pad = new THREE.Mesh(new THREE.CylinderGeometry(apt.radius * 0.62, apt.radius * 0.62, 26, 28), padMat);
+    pad.position.set(px, groundY + 13, pz);
+    group.add(pad);
+    themes.push({ mat: padMat, day: 0x595961, night: 0x1a2026, closed: 0x5a2f2b });
+
+    const rLen = apt.radius * 1.3;
+    for (const angle of [0, Math.PI / 2]) {
+      const rwyMat = new THREE.MeshPhongMaterial({ opacity: 0.85, transparent: true });
+      const rwy = new THREE.Mesh(new THREE.BoxGeometry(rLen, 6, 26), rwyMat);
+      rwy.position.set(px, groundY + 16, pz);
+      rwy.rotation.y = angle;
+      group.add(rwy);
+      themes.push({ mat: rwyMat, day: 0xe2e2e2, night: 0x8a95a8, closed: 0xbb7777 });
+    }
+
+    const termMat = new THREE.MeshPhongMaterial();
+    const term = new THREE.Mesh(new THREE.BoxGeometry(140, 60, 80), termMat);
+    term.position.set(px + apt.radius * 0.62 * 0.55, groundY + 30, pz);
+    group.add(term);
+    themes.push({ mat: termMat, day: 0x9aa0a6, night: 0x22262c, closed: 0x74423b });
+
+    const roofMat = new THREE.MeshPhongMaterial();
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(150, 12, 92), roofMat);
+    roof.position.set(px + apt.radius * 0.62 * 0.55, groundY + 62, pz);
+    group.add(roof);
+    themes.push({ mat: roofMat, day: 0x61666b, night: 0x14171c, closed: 0x552e28 });
+
+    const label = makeTextSprite(apt.closed ? "CLOSED" : apt.name, 0xffffff);
+    label.position.set(px, groundY + 110, pz);
+    label.scale.set(430, 180, 1);
+    group.add(label);
+    themes.push({ mat: label.material, day: 0x143014, night: 0xddf5dd, closed: 0xff4433 });
+
+    group.userData.closed = apt.closed;
+    this.scene.add(group);
+    this.airportGroups.set(apt.id, group);
+    this.airportThemes.set(apt.id, themes);
+  }
+
+  private disposeAirport(id: string) {
+    const group = this.airportGroups.get(id);
+    if (group) {
+      this.scene.remove(group);
+      group.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          child.geometry.dispose();
+          (child.material as THREE.Material).dispose();
+        }
+        if (child instanceof THREE.Sprite) {
+          child.geometry.dispose();
+          (child.material as THREE.Material).dispose();
+        }
+      });
+    }
+    this.airportGroups.delete(id);
+    this.airportThemes.delete(id);
+  }
+
+  private applyAirportTheme(day: boolean) {
+    for (const [id, themes] of this.airportThemes) {
+      const closed = this.airportGroups.get(id)?.userData.closed === true;
+      for (const t of themes) {
+        t.mat.color.setHex(closed && t.closed !== undefined ? t.closed : day ? t.day : t.night);
+      }
+    }
+  }
+
+  // ────── terrain (hills, mountains, trees, rocks) ──────
+
+  private ensureTerrain() {
+    if (this.terrainGroup) return;
+    const air = this.lastSnapshot!.airspace;
+    const group = new THREE.Group();
+    this.terrainGroup = group;
+    this.scene.add(group);
+
+    const rnd = mulberry32(1337);
+    const cx = air.width / 2;
+    const cz = air.depth / 2;
+    const mainHalf = air.width + 12000;
+    const groundY = air.floor - GROUND_CLEARANCE;
+    const airports = air.airports.map((a) => a.center);
+
+    const clearOf = (x: number, z: number, r: number) =>
+      airports.every(([ax, , az]) => Math.hypot(x - ax, z - az) > r);
+
+    const scatter = (half: number, minClear: number): [number, number] | null => {
+      for (let tries = 0; tries < 12; tries++) {
+        const x = cx + (rnd() * 2 - 1) * half;
+        const z = cz + (rnd() * 2 - 1) * half;
+        if (clearOf(x, z, minClear)) return [x, z];
+      }
+      return null;
+    };
+
+    const themed = (mat: THREE.MeshLambertMaterial, day: number, night: number) => {
+      this.terrainThemes.push({ mat, day, night });
+      return mat;
+    };
+
+    // rolling hills
+    for (let i = 0; i < 90; i++) {
+      const spot = scatter(mainHalf, 1500);
+      if (!spot) continue;
+      const rx = 260 + rnd() * 360;
+      const rz = rx * (0.8 + rnd() * 0.4);
+      const ry = 40 + rnd() * 140;
+      const mat = themed(new THREE.MeshLambertMaterial(), 0x3e7d33, 0x0f2214);
+      const hill = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8), mat);
+      hill.scale.set(rx, ry, rz);
+      hill.position.set(spot[0], groundY + ry * 0.5, spot[1]);
+      group.add(hill);
+    }
+
+    // mountains
+    for (let i = 0; i < 12; i++) {
+      const spot = scatter(mainHalf * 0.8, 2200);
+      if (!spot) continue;
+      const rx = 360 + rnd() * 420;
+      const rz = rx * (0.8 + rnd() * 0.4);
+      const ry = 260 + rnd() * 260;
+      const mat = themed(new THREE.MeshLambertMaterial(), 0x6d796c, 0x21271f);
+      const mountain = new THREE.Mesh(new THREE.ConeGeometry(1, 1, 6), mat);
+      mountain.scale.set(rx, ry, rz);
+      mountain.position.set(spot[0], groundY + ry * 0.5, spot[1]);
+      group.add(mountain);
+    }
+
+    // trees in small clusters
+    const treeMat = themed(new THREE.MeshLambertMaterial(), 0x2f6b2f, 0x0e2416);
+    const trunkMat = themed(new THREE.MeshLambertMaterial(), 0x6b5233, 0x241a0e);
+    const treeGeo = new THREE.ConeGeometry(1, 1, 5);
+    const trunkGeo = new THREE.CylinderGeometry(1, 1, 1, 5);
+    for (let i = 0; i < 30; i++) {
+      const spot = scatter(mainHalf * 0.9, 1600);
+      if (!spot) continue;
+      const n = 3 + Math.floor(rnd() * 3);
+      for (let j = 0; j < n; j++) {
+        const ox = spot[0] + (rnd() * 2 - 1) * 260;
+        const oz = spot[1] + (rnd() * 2 - 1) * 260;
+        if (!clearOf(ox, oz, 1300)) continue;
+        const h = 34 + rnd() * 26;
+        const tw = h * (0.45 + rnd() * 0.2);
+        const tree = new THREE.Mesh(treeGeo, treeMat);
+        tree.scale.set(tw, h, tw);
+        tree.position.set(ox, groundY + h * 0.5, oz);
+        group.add(tree);
+        const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+        trunk.scale.set(tw * 0.18, h * 0.18, tw * 0.18);
+        trunk.position.set(ox, groundY + h * 0.1, oz);
+        group.add(trunk);
+      }
+    }
+
+    // rocks
+    const rockMat = themed(new THREE.MeshLambertMaterial(), 0x7a7f74, 0x262c2f);
+    for (let i = 0; i < 14; i++) {
+      const spot = scatter(mainHalf * 0.7, 1400);
+      if (!spot) continue;
+      const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(1, 0), rockMat);
+      const s = 12 + rnd() * 22;
+      rock.scale.set(s, s * 0.7, s);
+      rock.position.set(spot[0], groundY + s * 0.35, spot[1]);
+      group.add(rock);
+    }
+
+    // far hills — sparse relief toward the horizon
+    const farMat = themed(new THREE.MeshLambertMaterial(), 0x38702f, 0x0c1e12);
+    for (let i = 0; i < 40; i++) {
+      const ringR = 34000 + rnd() * 44000;
+      const a = rnd() * Math.PI * 2;
+      const x = cx - 7500 + Math.cos(a) * ringR;
+      const z = cz - 7500 + Math.sin(a) * ringR;
+      if (!clearOf(x, z, 3000)) continue;
+      const w0 = 340 + rnd() * 420;
+      const h0 = 30 + rnd() * 110;
+      const far = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 7), farMat);
+      far.scale.set(w0, h0, w0 * (0.8 + rnd() * 0.4));
+      far.position.set(x, groundY + h0 * 0.5, z);
+      group.add(far);
+    }
+
+    this.applyTerrainTheme(this.viewOptions.dayMode);
+  }
+
+  private applyTerrainTheme(day: boolean) {
+    for (const t of this.terrainThemes) {
+      t.mat.color.setHex(day ? t.day : t.night);
     }
   }
 
