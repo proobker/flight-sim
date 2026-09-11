@@ -1,5 +1,47 @@
 # SkyMesh — Implementation Log
 
+## v0.3.0 (v3) — Single-Server Build + Obstacle-Avoidance Path Planner + Enhanced 3D Scene
+
+### Date: September 11 2026
+
+### Summary
+
+Added physical-geofence obstacle avoidance to free-flying aircraft, packaged the app as a single production server (backend serves the built frontend at `/`), and upgraded the 3D scene to airplane meshes, a procedural sky/ground, airports, and destination/waypoint markers. All 15 backend tests pass.
+
+### What was built
+
+- **Obstacle-avoidance path planner** (`backend/simulation/airspace.py`):
+  - `waypoint_around(a, b, clearance)` — computes a detour waypoint on the perpendicular through the obstacle's closest point on [a,b], offset by `radius + clearance + 120`, choosing the side with the shorter total leg and skipping out-of-bounds candidates. Returns `None` when the straight line is clear or no safe detour exists.
+  - `_closest_point_param(p0, p1, c)` helper; tangent-point approach replaced after failing under turn-rate limits and boundary-clamping corner cases.
+- **Aircraft waypoint following** (`backend/simulation/aircraft.py`): `Aircraft.waypoint`, `waypoint_reached()`, heading toward the active waypoint before the destination in `steer_velocity()`, and `"waypoint"` included in the snapshot.
+- **Per-tick replanning** (`backend/engine/agent.py`): free-flight agents recompute `aircraft.waypoint = airspace.waypoint_around(position, destination, 300.0)` every step, so the detour stays flyable under the turn-rate limit.
+- **Tests** (`backend/tests/test_core.py`): 3 new — waypoint `None` when clear; waypoint routes around an obstacle; aircraft avoids an obstacle via its waypoint and then resumes course. **15/15 pass**; `pyflakes backend` clean.
+- **Single-server production build** (`backend/api/main.py`):
+  - `APP_VERSION = "0.3.0"`, `FRONTEND_DIST` auto-detection (`frontend/dist`).
+  - When the SPA build exists, `StaticFiles(directory=FRONTEND_DIST, html=True)` is mounted at `/` (registered last, so `/api` and `/ws` win) and the JSON root endpoint is disabled.
+- **Enhanced 3D scene** (`frontend/src/visualization/SkyScene.ts`):
+  - Airplane meshes (shared fuselage/nose/wings/tail/fin geometries) colored by priority, with red emissive for emergencies — replaces the cone markers.
+  - Procedural sky dome (ShaderMaterial gradient), 500 stars, sun sprite; textured ground plane (noise + field lines).
+  - Airports rendered as a pad, crossing runways, and an "AIRPORT" sprite label; obstacles drawn as translucent cylinders with emphasis rings (incl. storm/no-fly zones).
+  - Destination markers (pole + colored cone + ground ring) per aircraft and amber dashed waypoint lines.
+  - Fixed obstacle placement to use the same sim→three coordinate mapping as aircraft.
+- **`frontend/src/api/types.ts`**: `AircraftSnapshot.waypoint: [number, number, number] | null`.
+
+### Verification
+
+- `python -m pytest backend/tests -q` → 15 passed.
+- `python -m pyflakes backend` → clean.
+- `npm run build` passes (tsc strict + vite build).
+- Live single-server E2E at `http://127.0.0.1:8000/`: root serves the SPA (`text/html`, `#root` present), `/api/state` returns a live snapshot, and aircraft re-route around injected storms/no-fly zones (live `waypoint` values observed in the snapshot).
+- Scene content verified by reading the WebGL framebuffer headlessly: navy sky, textured green ground, cyan/colored aircraft, red conflict/obstacle pixels, purple storm columns and grey airport runways confirmed present. (Headless screenshot compositing of animated WebGL produced corrupt readbacks in this Edge build, so the framebuffer was captured directly via `readPixels`.)
+
+### Notes
+
+- Obstacle detours are horizontal only (cylinders span the whole flight envelope); climbing over geofences is out of scope.
+- `docs/screenshot.png` captured directly from the WebGL framebuffer (faithful but lower-frequency sampling than a real screenshot).
+
+---
+
 ## v0.2.0 (v2) — Frontend 3D Visualization (React + TypeScript + Three.js)
 
 ### Date: September 11 2026

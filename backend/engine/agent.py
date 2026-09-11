@@ -305,6 +305,11 @@ class AircraftAgent:
         self.apply_messages(msgs, now)
 
         self.aircraft.advance(dt)
+        if self.aircraft.plan is None:
+            if not self.aircraft.reached_destination():
+                self.aircraft.waypoint = self.airspace.waypoint_around(self.aircraft.position, self.aircraft.destination, 300.0)
+            else:
+                self.aircraft.waypoint = None
         if self.aircraft.reached_destination() and self.aircraft.plan is None:
             self.aircraft.destination = self.airspace.random_point(random, self.aircraft.cruise_altitude)
 

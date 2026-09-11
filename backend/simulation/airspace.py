@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,6 +91,52 @@ class Airspace:
                 hits.append(obs)
         return hits
 
+    def waypoint_around(
+        self,
+        a: tuple[float, float, float],
+        b: tuple[float, float, float],
+        clearance: float = 300.0,
+    ) -> tuple[float, float, float] | None:
+        """Horizontal avoidance waypoint for the straight segment a→b.
+
+        Computes a midpoint-offset detour: the waypoint is placed
+        perpendicular to the straight path at the point nearest the first
+        blocking obstacle, outside the protected disc. Both legs a→wp and
+        wp→b then clear the obstacle. Returns None when the path is clear.
+        """
+        hits = self.obstacles_between(a, b, clearance)
+        if not hits:
+            return None
+        hits.sort(key=lambda o: _closest_point_param(a, b, o))
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            return None
+        ux, uy = dx / length, dy / length
+        nx, ny = -uy, ux
+        margin = 120.0
+        best: tuple[float, float, float] | None = None
+        best_cost = math.inf
+        for obs in hits:
+            R = obs.radius + clearance
+            t_param = (obs.center[0] - a[0]) * ux + (obs.center[1] - a[1]) * uy
+            t_param = max(0.0, min(length, t_param))
+            px = a[0] + ux * t_param
+            py = a[1] + uy * t_param
+            for sign in (1.0, -1.0):
+                wx = px + nx * (R + margin) * sign
+                wy = py + ny * (R + margin) * sign
+                if wx < 0 or wx > self.width or wy < 0 or wy > self.depth:
+                    continue
+                leg = math.hypot(wx - a[0], wy - a[1]) + math.hypot(b[0] - wx, b[1] - wy)
+                if leg < best_cost:
+                    best_cost = leg
+                    best = (wx, wy, a[2])
+        if best is None:
+            return None
+        return self.enforce_bounds(best)
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "width": self.width,
@@ -122,3 +169,20 @@ def _segment_intersects_cylinder(
         return False
     pz = a[2] + (b[2] - a[2]) * t
     return abs(pz - obs.center[2]) <= obs.height / 2 + clearance
+
+
+def _closest_point_param(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+    obs: Obstacle,
+) -> float:
+    """Parameter t ∈ [0, 1] of the point on segment a→b nearest the obstacle."""
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    d2 = dx * dx + dy * dy
+    if d2 < 1e-9:
+        return 0.0
+    fx = a[0] - obs.center[0]
+    fy = a[1] - obs.center[1]
+    t = -(fx * dx + fy * dy) / d2
+    return max(0.0, min(1.0, t))

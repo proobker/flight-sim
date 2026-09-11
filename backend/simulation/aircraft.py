@@ -50,6 +50,7 @@ class Aircraft:
         self.id = aircraft_id
         self.position = position
         self.destination = destination
+        self.waypoint: tuple[float, float, float] | None = None
         self.speed = speed
         self.priority = priority
         self.cruise_altitude = cruise_altitude
@@ -94,8 +95,9 @@ class Aircraft:
         return self.steer_velocity()
 
     def steer_velocity(self) -> tuple[float, float, float]:
-        dx = self.destination[0] - self.position[0]
-        dy = self.destination[1] - self.position[1]
+        target = self.waypoint if self.waypoint is not None else self.destination
+        dx = target[0] - self.position[0]
+        dy = target[1] - self.position[1]
         desired = math.atan2(dx, dy)
         delta = _towards(self.heading, desired, self.turn_rate)
         target_z = physics.clamp_altitude(self.cruise_altitude, self.min_altitude, self.max_altitude)
@@ -144,6 +146,9 @@ class Aircraft:
     def reached_destination(self, threshold: float = 80.0) -> bool:
         return physics.h_distance(self.position, self.destination) < threshold
 
+    def waypoint_reached(self, threshold: float = 250.0) -> bool:
+        return self.waypoint is None or physics.h_distance(self.position, self.waypoint) < threshold
+
     def maneuver_plan(self, heading_offset: float, vertical_rate: float = 0.0) -> Plan:
         vel = physics.to_velocity(
             self.heading + heading_offset, self.speed, vertical_rate
@@ -160,6 +165,7 @@ class Aircraft:
             "speed": math.hypot(velocity[0], velocity[1]),
             "vertical_rate": velocity[2],
             "destination": list(self.destination),
+            "waypoint": list(self.waypoint) if self.waypoint is not None else None,
             "priority": self.priority,
             "emergency": self.emergency,
             "active": self.active,

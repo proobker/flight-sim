@@ -37,6 +37,7 @@ export interface AircraftSnapshot {
   emergency: boolean;
   active: boolean;
   trajectory_version: number;
+  waypoint: [number, number, number] | null;
   plan: [[number, number, number], number, number] | null;
   maneuvering: boolean;
   distance: number;

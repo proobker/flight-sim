@@ -1,17 +1,27 @@
-"""FastAPI server — REST control endpoints + WebSocket stream."""
+"""FastAPI server — REST control endpoints + WebSocket stream + static frontend."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from ..engine.simulator import SimConfig, Simulator
 
-app = FastAPI(title="SkyMesh", version="0.1.0")
+APP_VERSION = "0.3.0"
+FRONTEND_DIST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "frontend",
+    "dist",
+)
+HAS_FRONTEND = os.path.isdir(FRONTEND_DIST)
+
+app = FastAPI(title="SkyMesh", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,9 +56,11 @@ async def shutdown_simulator() -> None:
 
 # ────────── REST endpoints ──────────
 
-@app.get("/")
-async def root():
-    return {"name": "SkyMesh", "version": "0.1.0", "status": "running"}
+if not HAS_FRONTEND:
+
+    @app.get("/")
+    async def root():
+        return {"name": "SkyMesh", "version": APP_VERSION, "status": "running"}
 
 
 @app.get("/api/state")
@@ -147,3 +159,9 @@ def _broadcast_snapshot(snapshot: dict[str, Any]) -> None:
             asyncio.get_event_loop().create_task(ws.send_text(payload))
         except Exception:
             pass
+
+
+# ────────── static frontend (mounted last so /api and /ws win) ──────────
+
+if HAS_FRONTEND:
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="app")

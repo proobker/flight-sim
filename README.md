@@ -41,16 +41,26 @@ python -m backend.run --serve --aircraft 60 --port 8000
 # → ws://127.0.0.1:8000/ws        (live state stream)
 ```
 
-### Frontend
+### Frontend (single-server build)
+
+```bash
+cd frontend
+npm install
+npm run build          # produces frontend/dist
+cd ..
+python -m backend.run --serve --aircraft 60 --tick-rate 12 --sim-speed 1.0
+# → http://127.0.0.1:8000/     (production build served by the backend)
+# → http://127.0.0.1:8000/docs  (Swagger UI)
+```
+
+When `frontend/dist` exists, the backend serves the built SPA at `/` (FastAPI `StaticFiles`), so a single process runs the whole stack. For frontend development, run Vite separately instead:
 
 ```bash
 cd frontend
 npm install
 npm run dev
-# → http://localhost:5173  (visualizes the sim via WebSocket)
+# → http://localhost:5173  (proxies /api and /ws to port 8000)
 ```
-
-Start the backend first (`python -m backend.run --serve`), then the frontend. The Vite dev server proxies `/api` and `/ws` to port 8000.
 
 ![SkyMesh 3D visualization](docs/screenshot.png)
 
@@ -73,6 +83,10 @@ Start the backend first (`python -m backend.run --serve`), then the frontend. Th
 ### WebSocket `/ws`
 
 Pushes a full snapshot JSON at ~10 Hz while the simulation runs.
+
+## Obstacle Avoidance
+
+Storms and no-fly zones are vertical cylinders. Free-flying aircraft heading toward an obstacle re-route around it: each tick the agent projects a perpendicular `waypoint_around(position, destination, clearance)` detour through the obstacle's closest point and steers toward it until the straight line to the destination is clear again (the waypoint is recomputed every step to obey the turn-rate limit). The current waypoint is exposed per aircraft in the snapshot (`aircraft[].waypoint`).
 
 ## Architecture
 
@@ -143,7 +157,9 @@ flight-sim/
 │   ├── api/          # FastAPI + WebSocket
 │   ├── tests/        # pytest
 │   └── run.py        # entry point
-├── frontend/         # React + Three.js (scaffold)
+├── frontend/         # React + Three.js (visualization)
+│   ├── src/visualization/SkyScene.ts  # 3D scene (planes, sky, ground, airports)
+│   └── dist/         # production build (generated, served by the backend)
 ├── docs/             # architecture, API, implementation log
 └── skymesh.md        # original design document
 ```
