@@ -1,4 +1,4 @@
-import type { SimSnapshot } from "../api/types";
+import type { SimSnapshot, Airport, Runway } from "../api/types";
 
 const metricStyle: React.CSSProperties = {
   display: "flex",
@@ -53,6 +53,8 @@ export function Dashboard({
   setDayMode,
   showConflicts,
   setShowConflicts,
+  showTags,
+  setShowTags,
   onReset,
 }: {
   snapshot: SimSnapshot | null;
@@ -60,6 +62,8 @@ export function Dashboard({
   setDayMode: (v: boolean) => void;
   showConflicts: boolean;
   setShowConflicts: (v: boolean) => void;
+  showTags: boolean;
+  setShowTags: (v: boolean) => void;
   onReset: () => void;
 }) {
   if (!snapshot) {
@@ -87,6 +91,24 @@ export function Dashboard({
     ["Sim time", `${snapshot.time.toFixed(1)}s`],
   ];
 
+  const windVec = snapshot.wind?.vector ?? null;
+  const runwayRating = (r: Runway): number => {
+    if (!windVec) return 0;
+    return -(windVec[0] * Math.sin(r.heading) + windVec[1] * Math.cos(r.heading));
+  };
+  const activeRunway = (a: Airport): Runway | null => {
+    if (!a.runways.length) return null;
+    return [...a.runways].sort((p, q) => runwayRating(q) - runwayRating(p))[0];
+  };
+  const inbound = (a: Airport): number =>
+    snapshot.aircraft.filter((x) => x.active && x.dest_aid === a.id).length;
+  const runwayRow = (a: Airport): string => {
+    const r = activeRunway(a);
+    return r
+      ? `${a.name} R${r.heading_label} · ${inbound(a)} inbound`
+      : `${a.name} · ${inbound(a)} inbound`;
+  };
+
   return (
     <div className="panel dashboard">
       <h2>SKYMESH <span className="dot">&#9679;</span></h2>
@@ -99,6 +121,23 @@ export function Dashboard({
         ))}
       </div>
 
+      {snapshot.wind && (
+        <div style={{ borderTop: "1px solid #1a3a2a", marginTop: 8, paddingTop: 6 }}>
+          <div style={metricStyle}>
+            <span style={labelStyle}>WIND</span>
+            <span style={valueStyle}>
+              {snapshot.wind.direction} · {snapshot.wind.speed.toFixed(1)} m/s
+            </span>
+          </div>
+          {snapshot.airspace.airports.map((a) => (
+            <div key={a.id} style={metricStyle}>
+              <span style={labelStyle}>{"· " + a.id}</span>
+              <span style={valueStyle}>{runwayRow(a)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div style={{ borderTop: "1px solid #1a3a2a", marginTop: 8, paddingTop: 6 }}>
         <div style={toggleRow}>
           <span>DAY MODE</span>
@@ -110,6 +149,12 @@ export function Dashboard({
           <span>CONFLICTS</span>
           <div style={toggleTrack(showConflicts)} onClick={() => setShowConflicts(!showConflicts)}>
             <div style={toggleKnob(showConflicts)} />
+          </div>
+        </div>
+        <div style={toggleRow}>
+          <span>TAGS</span>
+          <div style={toggleTrack(showTags)} onClick={() => setShowTags(!showTags)}>
+            <div style={toggleKnob(showTags)} />
           </div>
         </div>
         <button

@@ -63,6 +63,11 @@ def state_update(
     emergency: bool,
     trajectory_version: int,
     plan: list[tuple[float, float, float]],
+    *,
+    phase: str | None = None,
+    wake: str | None = None,
+    origin_aid: str | None = None,
+    dest_aid: str | None = None,
 ) -> dict[str, Any]:
     return message(
         STATE_UPDATE,
@@ -78,6 +83,10 @@ def state_update(
         emergency=emergency,
         trajectory_version=trajectory_version,
         plan=plan,
+        phase=phase,
+        wake=wake,
+        origin_aid=origin_aid,
+        dest_aid=dest_aid,
     )
 
 

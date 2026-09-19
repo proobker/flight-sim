@@ -1,4 +1,4 @@
-"""Airspace world model — bounds, airports, and dynamic hazards (no-fly zones, storms)."""
+"""Airspace world model — bounds, airports, runways, and dynamic hazards."""
 
 from __future__ import annotations
 
@@ -7,11 +7,18 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
+from .fleet import AircraftType
+from . import physics
 
 AIRPORT_NAMES = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"]
 
 # Discrete cruise levels so neighbouring flights sit in different bands.
-ALTITUDE_BANDS = [1200.0, 1600.0, 2000.0, 2600.0, 3200.0]
+# Now real-ish RVSM-scale levels for a 160 km terminal area.
+ALTITUDE_BANDS = [1500.0, 1800.0, 2100.0, 2400.0, 2800.0, 3200.0, 3600.0, 4000.0]
+
+# Distance from an airport inside which terminal (3 km) separation applies
+# instead of the en-route (5 km) standard.
+TERMINAL_RADIUS = 40000.0
 
 
 def random_cruise_altitude(rng=None) -> float:
@@ -20,23 +27,158 @@ def random_cruise_altitude(rng=None) -> float:
 
 
 @dataclass
+class Runway:
+    """A real runway: heading, length, and the touchdown (threshold) point.
+
+    `heading` is the inbound direction of travel in radians: aircraft land and
+    roll out moving along it, and departures accelerate along it from the
+    far end toward the threshold.
+    """
+
+    rid: str
+    heading: float
+    length: float
+    threshold: tuple[float, float, float]
+    elevation: float
+    width: float = 48.0
+
+    @property
+    def u(self) -> tuple[float, float]:
+        """Unit vector of travel (final approach / rollout / departure)."""
+        return (math.sin(self.heading), math.cos(self.heading))
+
+    @property
+    def n(self) -> tuple[float, float]:
+        """Pattern side unit vector — left of the direction of travel."""
+        return (-math.cos(self.heading), math.sin(self.heading))
+
+    def departure_point(self) -> tuple[float, float, float]:
+        ux, uy = self.u
+        return (self.threshold[0] - ux * self.length, self.threshold[1] - uy * self.length, self.elevation)
+
+    def approach_fix(self, final_len: float) -> tuple[float, float, float]:
+        """Straight-on point on the extended centerline, before the threshold."""
+        ux, uy = self.u
+        return (self.threshold[0] - ux * final_len, self.threshold[1] - uy * final_len, self.elevation)
+
+    def downwind_entry(self, t: "AircraftType") -> tuple[float, float, float]:
+        """Where the pattern begins: abeam, offset onto the pattern side."""
+        ux, uy = self.u
+        nx, ny = self.n
+        p = t.pattern_offset
+        return (
+            self.threshold[0] + ux * t.downwind_len + nx * p,
+            self.threshold[1] + uy * t.downwind_len + ny * p,
+            self.gs_alt(t.pattern_alt_agl),
+        )
+
+    def downwind_abeam(self, t: "AircraftType") -> tuple[float, float, float]:
+        """Turn-from-downwind-to-base point, level with the departure end."""
+        ux, uy = self.u
+        nx, ny = self.n
+        p = t.pattern_offset
+        ex, ey, ez = self.departure_point()
+        return (ex + nx * p, ey + ny * p, self.gs_alt(t.pattern_alt_agl))
+
+    def pattern_alt(self, t: "AircraftType") -> float:
+        return self.gs_alt(t.pattern_alt_agl)
+
+    def gs_alt(self, agl: float) -> float:
+        """Field-relative altitude: runway sits on the airspace floor."""
+        return self.elevation + agl
+
+    def heading_label(self) -> str:
+        deg = int(round((self.heading * 180.0 / math.pi) % 360.0))
+        return f"{deg:02d}"
+
+    def into_wind_rating(self, wind: "tuple[float, float, float] | None") -> float:
+        """Positive = headwind for landings on this runway (better)."""
+        if wind is None:
+            return 0.0
+        ux, uy = self.u
+        return -(wind[0] * ux + wind[1] * uy)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.rid,
+            "heading": round(self.heading, 4),
+            "heading_label": self.heading_label(),
+            "length": self.length,
+            "threshold": list(self.threshold),
+            "elevation": self.elevation,
+        }
+
+
+@dataclass
 class Airport:
-    """A landing field aircraft spawn from and fly to."""
+    """A landing field aircraft spawn from and fly to.
+
+    Runways are assigned lazily on first access (after the default world is
+    built) so tests that construct bare `Airport`s keep working.
+    """
 
     aid: str
     name: str
     position: tuple[float, float, float]
     radius: float = 1200.0
     closed: bool = False
+    hub: bool = False
+    runways: list[Runway] = None  # type: ignore[assignment]
+
+    def _ensure_runways(self) -> None:
+        if self.runways is None:
+            self.runways = _build_runways(self)
+
+    def active_runway(self, wind=None) -> Runway:
+        """Runway with the best headwind component, or the first."""
+        self._ensure_runways()
+        return max(self.runways, key=lambda r: (r.into_wind_rating(wind), r.heading == self.runways[0].heading))
 
     def snapshot(self) -> dict[str, Any]:
+        self._ensure_runways()
         return {
             "id": self.aid,
             "name": self.name,
             "center": list(self.position),
             "radius": self.radius,
             "closed": self.closed,
+            "hub": self.hub,
+            "runways": [r.snapshot() for r in self.runways],
         }
+
+
+# Inbound headings (rad) per airport. Varied so traffic patterns do not stack.
+_RUNWAY_SPECS: dict[str, tuple] = {
+    "APT1": ((math.radians(62), 3400.0), (math.radians(143), 3000.0)),
+    "APT2": ((math.radians(98), 2700.0),),
+    "APT3": ((math.radians(250), 2400.0),),
+    "APT4": ((math.radians(358), 1900.0),),
+    "APT5": ((math.radians(300), 1800.0),),
+    "APT6": ((math.radians(207), 1800.0),),
+}
+
+
+def _build_runways(airport: Airport) -> list[Runway]:
+    elev = airport.position[2]
+    specs = _RUNWAY_SPECS.get(airport.aid)
+    if specs is None:
+        specs = ((math.radians(90), max(1800.0, airport.radius * 2.2)),)
+    out: list[Runway] = []
+    for i, (heading, length) in enumerate(specs):
+        ux, uy = math.sin(heading), math.cos(heading)
+        # Threshold sits 55% of runway length ahead of the pad; the pad is the
+        # taxi-in target roughly mid-runway.
+        thr = (airport.position[0] + ux * length * 0.55, airport.position[1] + uy * length * 0.55, elev)
+        out.append(
+            Runway(
+                rid=f"{airport.aid}-R{i + 1}",
+                heading=heading,
+                length=length,
+                threshold=thr,
+                elevation=elev,
+            )
+        )
+    return out
 
 
 @dataclass
@@ -72,43 +214,60 @@ class Obstacle:
 class Airspace:
     def __init__(
         self,
-        width: float = 20000.0,
-        depth: float = 20000.0,
+        width: float = 160000.0,
+        depth: float = 160000.0,
         floor: float = 100.0,
         ceiling: float = 6000.0,
         airports: list[Airport] | None = None,
+        wind: tuple[float, float, float] | None = None,
     ) -> None:
         self.width = width
         self.depth = depth
         self.floor = floor
         self.ceiling = ceiling
+        self.wind = wind
         self.obstacles: list[Obstacle] = []
         self.airports: list[Airport] = airports if airports is not None else self._default_airports()
+        for a in self.airports:
+            self.add_runways_for(a)
         self._next_obs = 0
 
     def _default_airports(self) -> list[Airport]:
-        """Six strings spread around the field: four corners plus two edge midpoints."""
+        """Six strings spread over the (scaled) field: one hub near centre plus
+        reliever fields around it, so the terminal-area scale reads like a
+        metroplex rather than six pads stacked corner-to-corner."""
         w, d = self.width, self.depth
-        fh = 0.10
+        cx, cy = w * 0.5, d * 0.5
         spots = [
-            (w * fh, d * fh),
-            (w * (1 - fh), d * fh),
-            (w * fh, d * (1 - fh)),
-            (w * (1 - fh), d * (1 - fh)),
-            (w * 0.5, d * 0.06),
-            (w * 0.5, d * 0.94),
+            (cx, cy, True),  # ALPHA — the hub
+            (w * 0.22, d * 0.30, False),
+            (w * 0.80, d * 0.22, False),
+            (w * 0.24, d * 0.78, False),
+            (w * 0.78, d * 0.80, False),
+            (w * 0.60, d * 0.55, False),
         ]
         pads: list[Airport] = []
-        for i, (x, y) in enumerate(spots):
+        for i, (x, y, hub) in enumerate(spots):
             pads.append(
                 Airport(
                     aid=f"APT{i + 1}",
                     name=AIRPORT_NAMES[i],
                     position=(x, y, self.floor + 40.0),
-                    radius=1200.0,
+                    radius=1400.0 if hub else 1200.0,
+                    hub=hub,
                 )
             )
         return pads
+
+    def pick_runway(self, airport: Airport) -> Runway:
+        """The arrival runway an inbound flight will be assigned."""
+        airport._ensure_runways()
+        if not airport.runways:
+            raise RuntimeError(f"airport {airport.aid} has no runways")
+        return airport.active_runway(wind=getattr(self, "wind", None))
+
+    def add_runways_for(self, airport: Airport) -> None:
+        airport._ensure_runways()
 
     def random_airport(self, rng=None, exclude_id: str | None = None) -> Airport:
         rng = rng or random

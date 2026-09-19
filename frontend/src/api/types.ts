@@ -9,12 +9,29 @@ export interface Obstacle {
   active: boolean;
 }
 
+export interface Runway {
+  id: string;
+  heading: number;
+  heading_label: string;
+  length: number;
+  threshold: [number, number, number];
+  elevation: number;
+}
+
 export interface Airport {
   id: string;
   name: string;
   center: [number, number, number];
   radius: number;
   closed: boolean;
+  hub: boolean;
+  runways: Runway[];
+}
+
+export interface WindInfo {
+  vector: [number, number, number];
+  speed: number;
+  direction: string;
 }
 
 export interface AirspaceSnapshot {
@@ -48,6 +65,11 @@ export interface AircraftSnapshot {
   origin_aid: string | null;
   dest_aid: string | null;
   state: "cruise" | "landing" | "held";
+  phase: string;
+  type: string;
+  wake: string;
+  runway: string | null;
+  dep_runway: string | null;
   progress: number;
   leg_distance: number;
   trajectory_version: number;
@@ -64,6 +86,7 @@ export interface AircraftSnapshot {
 export interface SimSnapshot {
   time: number;
   config: { multicast_group: string; multicast_port: number; comm_range: number };
+  wind?: WindInfo;
   airspace: AirspaceSnapshot;
   aircraft_count: number;
   total_spawned: number;

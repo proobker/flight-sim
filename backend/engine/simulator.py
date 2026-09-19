@@ -14,25 +14,31 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..network.udp_node import UdpNode
+from ..simulation import physics
 from ..simulation.aircraft import Aircraft
 from ..simulation.airspace import Airspace, random_cruise_altitude
 from ..simulation.conflict import ConflictDetector
+from ..simulation.fleet import assign_type
+from ..terminal import TerminalController
 from .agent import AircraftAgent
 from .metrics import Metrics
+
+# Ambient wind vector (metres/sec), roughly 8 m/s westerly.
+WIND = (-7.0, -3.5, 0.0)
 
 
 @dataclass
 class SimConfig:
-    num_aircraft: int = 60
+    num_aircraft: int = 40
     tick_rate: float = 12.0
     sim_speed: float = 1.0
-    airspace_width: float = 15000.0
-    airspace_depth: float = 15000.0
+    airspace_width: float = 160000.0
+    airspace_depth: float = 160000.0
     airspace_floor: float = 100.0
-    airspace_ceiling: float = 5000.0
+    airspace_ceiling: float = 6000.0
     cruise_altitude: float = 2000.0
     speed_range: tuple[float, float] = (120.0, 220.0)
-    comm_range: float = 6000.0
+    comm_range: float = 24000.0
     packet_loss: float = 0.0
     latency_ms: float = 0.0
     multicast_group: str = "239.255.42.99"
@@ -47,8 +53,10 @@ class Simulator:
             depth=self.config.airspace_depth,
             floor=self.config.airspace_floor,
             ceiling=self.config.airspace_ceiling,
+            wind=WIND,
         )
-        self.detector = ConflictDetector()
+        self.detector = ConflictDetector(airspace=self.airspace)
+        self.terminal = TerminalController()
         self.agents: list[AircraftAgent] = []
         self.node_ids: dict[str, UdpNode] = {}
         self.metrics = Metrics()
@@ -87,54 +95,65 @@ class Simulator:
             aid = f"A{next(self._next_id):03d}"
             start = self.airspace.random_airport(self._rng)
             dest_airport = self.airspace.random_airport(self._rng, exclude_id=start.aid)
-            pos = self._runway_spot(start)
-            dest = dest_airport.position
-            speed = self._rng.uniform(*self.config.speed_range)
-            heading = math.atan2(dest[0] - pos[0], dest[1] - pos[1])
+            dep_rwy = start.active_runway(self.airspace.wind)
+            dest_rwy = self.airspace.pick_runway(dest_airport)
+            fleet = assign_type(self._rng, hub=start.hub)
+            pos, heading = self._departure_spot(dep_rwy)
             ac = Aircraft(
                 aircraft_id=aid,
                 position=pos,
-                destination=dest,
-                speed=speed,
+                destination=dest_airport.position,
+                speed=0.0,
                 heading=heading,
                 cruise_altitude=random_cruise_altitude(self._rng),
                 priority=random.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
+                fleet=fleet,
             )
+            ac.phase = "taxi_out"
+            ac.dep_runway = dep_rwy
+            ac.runway = dest_rwy
+            ac.dest_airport = dest_airport
             ac.origin_aid = start.aid
             ac.dest_aid = dest_airport.aid
-            ac.leg_distance = math.hypot(dest[0] - pos[0], dest[1] - pos[1])
-            node = UdpNode(
-                aircraft_id=aid,
-                multicast_group=self.config.multicast_group,
-                multicast_port=self.config.multicast_port,
-                loss=self.config.packet_loss,
-                latency_ms=self.config.latency_ms,
-            )
-            agent = AircraftAgent(
-                aircraft=ac,
-                node=node,
-                detector=self.detector,
-                airspace=self.airspace,
-                sim_time=0.0,
-                broadcast_every=6,
-                detect_every=3,
-                max_proposal_rounds=2,
-                comm_range=self.config.comm_range,
-                metrics=self.metrics,
-            )
-            node.start()
-            self.agents.append(agent)
-            self.node_ids[aid] = node
+            ac.leg_distance = physics.h_distance(pos, dest_airport.position)
+            self._wire_agent(ac, start)
             self._spawned += 1
 
-    def _runway_spot(self, airport) -> tuple[float, float, float]:
-        """A takeoff position near the airport pad — slightly offset so aircraft fan out."""
-        r = airport.radius * 0.55
-        angle = self._rng.uniform(0.0, math.pi * 2)
-        x = airport.position[0] + math.cos(angle) * r * self._rng.uniform(0.4, 1.0)
-        y = airport.position[1] + math.sin(angle) * r * self._rng.uniform(0.4, 1.0)
-        z = airport.position[2] + self._rng.uniform(0.0, 60.0)
-        return (x, y, z)
+    def _departure_spot(self, runway) -> tuple[tuple[float, float, float], float]:
+        """A taxi-out start just past the departure end, staggered a little."""
+        ux, uy = runway.u
+        back = self._rng.uniform(30.0, 260.0)
+        px = runway.threshold[0] - ux * runway.length - ux * back
+        py = runway.threshold[1] - uy * runway.length - uy * back
+        return (px, py, runway.elevation), runway.heading
+
+    def _wire_agent(self, ac: Aircraft, port=None) -> None:
+        aid = ac.id
+        node = UdpNode(
+            aircraft_id=aid,
+            multicast_group=self.config.multicast_group,
+            multicast_port=self.config.multicast_port,
+            loss=self.config.packet_loss,
+            latency_ms=self.config.latency_ms,
+        )
+        agent = AircraftAgent(
+            aircraft=ac,
+            node=node,
+            detector=self.detector,
+            airspace=self.airspace,
+            sim_time=self.sim_time,
+            broadcast_every=6,
+            detect_every=3,
+            max_proposal_rounds=2,
+            comm_range=self.config.comm_range,
+            metrics=self.metrics,
+            terminal=self.terminal,
+        )
+        if port is not None:
+            agent.hold_timer = self._rng.uniform(0.0, 6.0)
+        node.start()
+        self.agents.append(agent)
+        self.node_ids[aid] = node
 
     async def spawn_emergency(self) -> AircraftAgent:
         aid = f"E{next(self._next_id):03d}"
@@ -151,26 +170,9 @@ class Simulator:
         )
         ac.dest_aid = dest_port.aid
         ac.leg_distance = math.hypot(dest[0] - pos[0], dest[1] - pos[1])
-        node = UdpNode(
-            aircraft_id=aid,
-            multicast_group=self.config.multicast_group,
-            multicast_port=self.config.multicast_port,
-            loss=self.config.packet_loss,
-            latency_ms=self.config.latency_ms,
-        )
-        agent = AircraftAgent(
-            aircraft=ac,
-            node=node,
-            detector=self.detector,
-            airspace=self.airspace,
-            comm_range=self.config.comm_range,
-            metrics=self.metrics,
-        )
-        node.start()
-        self.agents.append(agent)
-        self.node_ids[aid] = node
+        self._wire_agent(ac)
         self._spawned += 1
-        return agent
+        return self.agents[-1]
 
     async def kill_aircraft(self, aircraft_id: str) -> bool:
         agent = self._find_agent(aircraft_id)
@@ -280,7 +282,8 @@ class Simulator:
         self._update_stale_metrics()
 
     def _check_collisions_and_separation(self) -> None:
-        active = [a for a in self.agents if a.aircraft.active and not a.aircraft.held]
+        active = [a for a in self.agents
+                  if a.aircraft.active and not a.aircraft.held and not a.aircraft.is_grounded()]
         min_sep = float("inf")
         for i in range(len(active)):
             for j in range(i + 1, len(active)):
@@ -331,6 +334,7 @@ class Simulator:
                 "comm_range": self.config.comm_range,
             },
             "airspace": self.airspace.snapshot(),
+            "wind": {"vector": list(WIND), "speed": round(math.hypot(WIND[0], WIND[1]), 1), "direction": "278°"},
             "aircraft_count": active_count,
             "total_spawned": total,
             "active": active_count,

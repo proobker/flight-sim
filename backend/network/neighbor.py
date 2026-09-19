@@ -32,6 +32,10 @@ class NeighborEntry:
     trajectory_version: int = 0
     plan: list[tuple[float, float, float]] = field(default_factory=list)
     confidence: float = 1.0
+    phase: str | None = None
+    wake: str | None = None
+    origin_aid: str | None = None
+    dest_aid: str | None = None
 
     def age(self, now: float) -> float:
         return max(0.0, now - self.last_seen)
@@ -85,6 +89,10 @@ class NeighborTable:
         raw_plan = msg.get("plan")
         if isinstance(raw_plan, list):
             entry.plan = [_vec(p) for p in raw_plan if _valid(p)]
+        entry.phase = msg.get("phase") or entry.phase
+        entry.wake = msg.get("wake") or entry.wake
+        entry.origin_aid = msg.get("origin_aid") or entry.origin_aid
+        entry.dest_aid = msg.get("dest_aid") or entry.dest_aid
 
     def prune(self, now: float, ttl: float = 20.0) -> None:
         for nid in [k for k, e in self.entries.items() if e.age(now) > ttl]:

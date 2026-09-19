@@ -12,6 +12,7 @@ export default function App() {
   const [sceneReady, setSceneReady] = useState(false);
   const [dayMode, setDayMode] = useState(false);
   const [showConflicts, setShowConflicts] = useState(true);
+  const [showTags, setShowTags] = useState(true);
 
   useEffect(() => {
     if (!containerRef.current || sceneRef.current) return;
@@ -24,8 +25,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    sceneRef.current?.setOptions({ dayMode, showConflicts });
-  }, [dayMode, showConflicts]);
+    sceneRef.current?.setOptions({ dayMode, showConflicts, showTags });
+  }, [dayMode, showConflicts, showTags]);
 
   useEffect(() => {
     if (snapshot && sceneRef.current) {
@@ -36,6 +37,7 @@ export default function App() {
   const handleReset = () => {
     setDayMode(false);
     setShowConflicts(true);
+    setShowTags(true);
     sceneRef.current?.resetView();
   };
 
@@ -69,6 +71,8 @@ export default function App() {
             setDayMode={setDayMode}
             showConflicts={showConflicts}
             setShowConflicts={setShowConflicts}
+            showTags={showTags}
+            setShowTags={setShowTags}
             onReset={handleReset}
           />
           <ControlPanel />

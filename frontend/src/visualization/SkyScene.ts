@@ -17,6 +17,28 @@ const STALE_LINE_COLOR = 0x995533;
 const CONFLICT_COLOR = 0xff2222;
 const WAYPOINT_COLOR = 0xffaa44;
 
+// Per-flight-phase body colours — the plane's livery carries the phase.
+const PHASE_COLORS: Record<string, number> = {
+  parked: 0x8a8a8a,
+  taxi_out: 0x9aa030,
+  line_up: 0xc0c020,
+  takeoff: 0x6fc050,
+  climbout: 0x42b062,
+  climb: 0x2aa890,
+  cruise: 0x38b0f0,
+  descent: 0xffa040,
+  downwind: 0xff8840,
+  base: 0xff6644,
+  final: 0xff5540,
+  flare: 0xee4433,
+  rollout: 0x808080,
+  taxi_in: 0x777788,
+  go_around: 0xff5544,
+};
+const GROUND_PHASES = new Set([
+  "parked", "taxi_out", "line_up", "takeoff", "rollout", "taxi_in",
+]);
+
 // Deterministic palette keyed to airport id (APT1..APT6).
 const AIRPORT_COLORS = [0xe8593a, 0xe8a33a, 0x4ac95f, 0x3ac9c9, 0x4a7fe8, 0xb56ce8];
 
@@ -276,11 +298,15 @@ class AircraftVisual {
   waypointLine: THREE.Line;
   trailPoints: THREE.Vector3[] = [];
   trailLine: THREE.Line;
+  label: THREE.Sprite;
 
   private originColor: THREE.Color;
   private destColor: THREE.Color;
   private smoothHeading: number | null = null;
   private bankAngle = 0;
+  private labelCtx: CanvasRenderingContext2D;
+  private labelMap: THREE.CanvasTexture;
+  private labelKey = "";
 
   constructor(originColor: number, destColor: number) {
     this.group = new THREE.Group();
@@ -290,6 +316,19 @@ class AircraftVisual {
     this.airplane = group;
     this.airplaneMat = mat;
     this.group.add(this.airplane);
+
+    const labelCanvas = document.createElement("canvas");
+    labelCanvas.width = 256;
+    labelCanvas.height = 170;
+    this.labelCtx = labelCanvas.getContext("2d")!;
+    this.labelMap = new THREE.CanvasTexture(labelCanvas);
+    this.label = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: this.labelMap, transparent: true, depthTest: false }),
+    );
+    this.label.scale.set(520, 345, 1);
+    this.label.position.set(0, 320, 0);
+    this.label.visible = false;
+    this.group.add(this.label);
 
     this.velocityLine = new THREE.Line(
       new THREE.BufferGeometry(),
@@ -330,9 +369,35 @@ class AircraftVisual {
     const pitch = THREE.MathUtils.clamp(-ac.vertical_rate * 0.004, -0.22, 0.22);
     this.airplane.rotation.set(pitch, this.smoothHeading, this.bankAngle);
 
-    // Body colour fades from origin airport to destination airport across the leg.
-    this.airplaneMat.color.copy(this.originColor).lerp(this.destColor, clamp01(ac.progress));
-    this.airplaneMat.emissive.setHex(ac.emergency ? 0xff2222 : 0x000000);
+    // Body colour is phase-driven: the phase livery replaces the route
+    // gradient, with a ground/emergency emissive so parked/rolling traffic
+    // reads at a glance.
+    const phaseColor = PHASE_COLORS[ac.phase];
+    if (phaseColor) {
+      this.airplaneMat.color.setHex(phaseColor);
+    } else {
+      this.airplaneMat.color.copy(this.originColor).lerp(this.destColor, clamp01(ac.progress));
+    }
+    this.airplaneMat.emissive.setHex(ac.emergency ? 0xff2222 : (phaseColor ?? 0x000000));
+    this.airplaneMat.emissiveIntensity = ac.emergency ? 0.9 : phaseColor ? (GROUND_PHASES.has(ac.phase) ? 0.3 : 0.45) : 0.0;
+
+    // Tag: aircraft id on top, flight phase beneath. Redrawn only when they change.
+    const tagKey = `${ac.id}|${ac.phase}`;
+    if (tagKey !== this.labelKey) {
+      this.labelKey = tagKey;
+      const ctx = this.labelCtx;
+      ctx.clearRect(0, 0, 256, 170);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 32px monospace";
+      ctx.fillText(ac.id, 128, 40);
+      ctx.fillStyle = "#aaddff";
+      ctx.font = "bold 22px monospace";
+      ctx.fillText(ac.phase.toUpperCase(), 128, 104);
+      ctx.fillStyle = phaseColor ? `#${phaseColor.toString(16).padStart(6, "0")}` : "#779966";
+      ctx.fillRect(88, 132, 80, 8);
+      this.labelMap.needsUpdate = true;
+    }
 
     const v = ac.velocity;
     const speed = Math.hypot(v[0], v[1]);
@@ -403,6 +468,8 @@ class AircraftVisual {
         (child.material as THREE.Material).dispose();
       }
     });
+    this.label.material.dispose();
+    this.labelMap.dispose();
   }
 }
 
@@ -411,6 +478,7 @@ class AircraftVisual {
 export interface ViewOptions {
   dayMode: boolean;
   showConflicts: boolean;
+  showTags: boolean;
 }
 
 export class SkyScene {
@@ -443,7 +511,7 @@ export class SkyScene {
 
   private lastSnapshot: SimSnapshot | null = null;
 
-  viewOptions: ViewOptions = { dayMode: false, showConflicts: true };
+  viewOptions: ViewOptions = { dayMode: false, showConflicts: true, showTags: true };
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -501,9 +569,16 @@ export class SkyScene {
     const prev = { ...this.viewOptions };
     if (opts.dayMode !== undefined) this.viewOptions.dayMode = opts.dayMode;
     if (opts.showConflicts !== undefined) this.viewOptions.showConflicts = opts.showConflicts;
+    if (opts.showTags !== undefined) this.viewOptions.showTags = opts.showTags;
 
     if (prev.dayMode !== this.viewOptions.dayMode) {
       this.rebuildEnvironment();
+    }
+
+    if (prev.showTags !== this.viewOptions.showTags) {
+      for (const vis of this.aircraftMap.values()) {
+        vis.label.visible = this.viewOptions.showTags;
+      }
     }
 
     if (prev.showConflicts !== this.viewOptions.showConflicts) {
@@ -779,15 +854,41 @@ export class SkyScene {
     group.add(pad);
     themes.push({ mat: padMat, day: 0x595961, night: 0x1a2026, closed: 0x5a2f2b });
 
-    const rLen = apt.radius * 1.3;
-    for (const angle of [0, Math.PI / 2]) {
-      const rwyMat = new THREE.MeshPhongMaterial({ opacity: 0.85, transparent: true });
-      const rwy = new THREE.Mesh(new THREE.BoxGeometry(rLen, 6, 26), rwyMat);
-      rwy.position.set(px, groundY + 16, pz);
-      rwy.rotation.y = angle;
-      rwy.receiveShadow = true;
-      group.add(rwy);
-      themes.push({ mat: rwyMat, day: 0xe2e2e2, night: 0x8a95a8, closed: 0xbb7777 });
+    if (apt.hub) {
+      const hubMat = new THREE.MeshPhongMaterial({ opacity: 0.5, transparent: true });
+      const apron = new THREE.Mesh(
+        new THREE.RingGeometry(apt.radius * 1.05, apt.radius * 1.2, 48),
+        hubMat,
+      );
+      apron.rotation.x = -Math.PI / 2;
+      apron.position.set(px, groundY + 18, pz);
+      group.add(apron);
+      themes.push({ mat: hubMat, day: 0x55555f, night: 0x20242a, closed: 0x4a2f2c });
+    }
+
+    // Real runways from the backend snapshot: asphalt strip + white centerline,
+    // aligned to each runway's inbound heading (sim → three: +y → +z).
+    for (const r of apt.runways) {
+      const ux = Math.sin(r.heading);
+      const uy = Math.cos(r.heading);
+      const cx = r.threshold[0] - ux * (r.length / 2);
+      const cz = r.threshold[1] - uy * (r.length / 2);
+      const rotY = r.heading - Math.PI / 2;
+
+      const stripMat = new THREE.MeshPhongMaterial({ opacity: 0.92, transparent: true });
+      const strip = new THREE.Mesh(new THREE.BoxGeometry(r.length, 8, 50), stripMat);
+      strip.position.set(cx, groundY + 7, cz);
+      strip.rotation.y = rotY;
+      strip.receiveShadow = true;
+      group.add(strip);
+      themes.push({ mat: stripMat, day: 0x3a3d42, night: 0x14161a, closed: 0x4a2f2c });
+
+      const lineMat = new THREE.MeshPhongMaterial({ opacity: 0.95, transparent: true });
+      const line = new THREE.Mesh(new THREE.BoxGeometry(r.length, 10, 6), lineMat);
+      line.position.set(cx, groundY + 9, cz);
+      line.rotation.y = rotY;
+      group.add(line);
+      themes.push({ mat: lineMat, day: 0xe8e8e8, night: 0x99a4b3, closed: 0xbb7777 });
     }
 
     const termMat = new THREE.MeshPhongMaterial();
@@ -832,7 +933,10 @@ export class SkyScene {
     group.add(beacon);
     themes.push({ mat: beaconMat, day: 0xffffff, night: 0xffffff, closed: 0x666666 });
 
-    const label = makeTextSprite(apt.closed ? "CLOSED" : apt.name, 0xffffff);
+    const label = makeTextSprite(
+      apt.closed ? "CLOSED" : apt.hub ? `${apt.name} · HUB` : apt.name,
+      0xffffff,
+    );
     label.position.set(px, groundY + 110, pz);
     label.scale.set(430, 180, 1);
     group.add(label);
@@ -929,7 +1033,7 @@ export class SkyScene {
       // Flatten around airports so runways sit exactly level.
       for (const a of airports) {
         const d = Math.hypot(lx - a.lx, ly - a.lz);
-        const R = a.r * 1.5;
+        const R = Math.max(a.r * 1.8, 2200.0);
         if (d < R) h *= smoothstep01(d / R);
       }
 
@@ -1161,6 +1265,7 @@ export class SkyScene {
           airportColorById(ac.dest_aid),
         );
         this.scene.add(vis.group);
+        vis.label.visible = this.viewOptions.showTags;
         this.aircraftMap.set(ac.id, vis);
       }
       vis.update(ac);

@@ -264,3 +264,261 @@ def test_snapshot_state_held_when_parked_at_runway():
     ac = Aircraft("R2", (500, 500, 140), (500, 500, 140), speed=0.0, cruise_altitude=2000.0)
     ac.held = True
     assert ac.snapshot()["state"] == "held"
+
+
+# ---------------------------------------------------------------------------
+# Flight phases, runways, and the terminal controller
+# ---------------------------------------------------------------------------
+
+from backend.simulation.aircraft import (  # noqa: E402
+    ARRIVAL_PHASES,
+    BASE,
+    CLIMB,
+    CLIMBOUT,
+    CRUISE,
+    DEPARTURE_PHASES,
+    DESCENT,
+    DOWNWIND,
+    FINAL,
+    FLARE,
+    GO_AROUND,
+    GROUND_PHASES,
+    LINE_UP,
+    PARKED,
+    ROLLOUT,
+    TAKEOFF,
+    TAXI_IN,
+    TAXI_OUT,
+)
+from backend.simulation.fleet import (  # noqa: E402
+    REGIONAL,
+    TYPES,
+    WAKE_HEAVY,
+    WAKE_LIGHT,
+    WAKE_MEDIUM,
+)
+from backend.terminal.sequencer import (  # noqa: E402
+    TerminalController,
+    departure_gap,
+    wake_gap,
+)
+
+
+def test_phase_envelopes_cover_every_phase():
+    all_phases = {
+        PARKED, TAXI_OUT, LINE_UP, TAKEOFF, CLIMBOUT, CLIMB, CRUISE,
+        DESCENT, DOWNWIND, BASE, FINAL, FLARE, ROLLOUT, TAXI_IN, GO_AROUND,
+    }
+    assert GROUND_PHASES | ARRIVAL_PHASES | DEPARTURE_PHASES == all_phases - {CRUISE}
+    assert CRUISE in all_phases
+
+
+def test_wake_gap_table():
+    assert wake_gap(WAKE_LIGHT, WAKE_HEAVY) == 240.0
+    assert wake_gap(WAKE_MEDIUM, WAKE_HEAVY) == 180.0
+    assert wake_gap(WAKE_HEAVY, WAKE_HEAVY) == 150.0
+    assert wake_gap(WAKE_LIGHT, WAKE_MEDIUM) == 150.0
+    assert wake_gap(WAKE_MEDIUM, WAKE_MEDIUM) == 120.0
+    assert wake_gap(WAKE_LIGHT, WAKE_LIGHT) == 120.0
+
+
+def test_departure_gap_table():
+    assert departure_gap(WAKE_LIGHT, WAKE_HEAVY) == 150.0
+    assert departure_gap(WAKE_MEDIUM, WAKE_HEAVY) == 120.0
+    assert departure_gap(WAKE_HEAVY, WAKE_HEAVY) == 120.0
+    assert departure_gap(WAKE_LIGHT, WAKE_MEDIUM) == 90.0
+    assert departure_gap(WAKE_MEDIUM, WAKE_MEDIUM) == 60.0
+
+
+def test_terminal_sequences_arrivals_by_wake_gap():
+    t = TerminalController()
+    t1 = t.request_final("A1", "RW", WAKE_LIGHT, eta=100.0, now=50.0)
+    assert t1 == pytest.approx(100.0)
+    t2 = t.request_final("A2", "RW", WAKE_LIGHT, eta=120.0, now=50.0)
+    assert t2 == pytest.approx(100.0 + wake_gap(WAKE_LIGHT, WAKE_LIGHT))
+    assert t.slot_open("A2", "RW", now=120.0) is False
+    assert t.slot_open("A2", "RW", now=220.0) is True
+
+
+def test_terminal_heavy_gap_pushes_light_traffic_back():
+    t = TerminalController()
+    t.request_final("H1", "RW", WAKE_HEAVY, eta=100.0, now=0.0)
+    o = t.request_final("L1", "RW", WAKE_LIGHT, eta=115.0, now=0.0)
+    assert o == pytest.approx(100.0 + 240.0)
+
+
+def test_terminal_go_around_reenters_ahed():
+    t = TerminalController()
+    t.request_final("A0", "RW", WAKE_LIGHT, eta=100.0, now=0.0)
+    o = t.request_go_around("A0", "RW", WAKE_LIGHT, eta=0.0, now=50.0)
+    assert o == pytest.approx(50.0)
+    aborted = [s for s in t.slots("RW") if s["status"] == "aborted"]
+    pending = [s for s in t.slots("RW") if s["status"] == "pending"]
+    assert len(aborted) == 1
+    assert len(pending) == 1
+    assert pending[0]["open_at"] == pytest.approx(50.0)
+    assert t.slot_open("A0", "RW", now=50.0) is True
+
+
+def test_clear_for_departure_gated_by_arrivals_and_departure_gap():
+    t = TerminalController()
+    t.request_final("A1", "RW", WAKE_LIGHT, eta=100.0, now=0.0)
+    # A departure now would still be rolling as A1 reaches the threshold.
+    assert t.clear_for_departure("D1", "RW", WAKE_MEDIUM, now=0.0) is False
+    # Once the arrival lands and clears the runway, departures may start...
+    t.note_landed("A1", "RW", now=150.0)
+    assert t.clear_for_departure("D2", "RW", WAKE_MEDIUM, now=250.0) is True
+    # ...but consecutive rollouts respect the departure gap.
+    assert t.clear_for_departure("D3", "RW", WAKE_MEDIUM, now=251.0) is False
+
+
+def test_landing_blocked_while_runway_busy():
+    t = TerminalController()
+    t.note_landed("A1", "RW", now=100.0)
+    assert t.landing_blocked("A2", "RW", now=150.0) is True
+    assert t.landing_blocked("A2", "RW", now=190.0) is False
+
+
+def test_aircraft_full_departure_sequence():
+    airspace = Airspace()
+    dep = airspace.airports[0]
+    dest = airspace.airports[1]
+    rw = dep.active_runway()
+    ac = Aircraft(
+        "D1",
+        rw.departure_point(),
+        destination=dest.position,
+        speed=0.0,
+        cruise_altitude=1500.0,
+        fleet=TYPES[REGIONAL],
+    )
+    ac.dep_runway = rw
+    ac.runway = rw
+    ac.phase = TAXI_OUT
+    phases: set[str] = set()
+    for _ in range(6000):
+        phases.add(ac.phase)
+        if ac.phase == LINE_UP:
+            ac.line_up_cleared = True
+        ac.advance(1.0)
+        if ac.phase == CRUISE:
+            break
+    assert {"taxi_out", "line_up", "takeoff", "climbout", "climb"} <= phases
+    assert ac.phase == CRUISE
+    assert ac.position[2] >= ac.cruise_altitude - 25.0
+
+
+def test_aircraft_descent_enters_downwind_near_runway():
+    airspace = Airspace()
+    apt = airspace.airports[1]
+    rw = apt.active_runway()
+    t = TYPES[REGIONAL]
+    ac = Aircraft(
+        "A1",
+        rw.downwind_entry(t),
+        destination=apt.position,
+        speed=t.descend_speed,
+        cruise_altitude=1800.0,
+        fleet=t,
+    )
+    ac.runway = rw
+    ac.dest_airport = apt
+    ac.phase = DESCENT
+    ac.advance(1.0)
+    assert ac.phase == DOWNWIND
+    assert ac.join_final is False
+
+
+def test_aircraft_go_around_rejoins_pattern():
+    airspace = Airspace()
+    apt = airspace.airports[1]
+    rw = apt.active_runway()
+    t = TYPES[REGIONAL]
+    ac = Aircraft(
+        "G1",
+        rw.downwind_entry(t),
+        destination=apt.position,
+        speed=t.approach_speed,
+        cruise_altitude=1800.0,
+        fleet=t,
+    )
+    ac.runway = rw
+    ac.dest_airport = apt
+    ac.phase = FINAL
+    ac.go_around = True
+    ac.advance(1.0)
+    assert ac.phase == GO_AROUND
+    ac.advance(1.0)
+    assert ac.phase == DOWNWIND
+    assert ac.go_around is False
+
+
+def test_final_approach_descends_to_glideslope():
+    airspace = Airspace()
+    apt = airspace.airports[1]
+    rw = apt.active_runway()
+    t = TYPES[REGIONAL]
+    ux, uy = rw.u
+    thr = rw.threshold
+    # 8 km out on the extended centerline, 500 m above the 3° glideslope.
+    px = thr[0] - ux * 8000.0
+    py = thr[1] - uy * 8000.0
+    ac = Aircraft(
+        "F1",
+        (px, py, rw.elevation + 500.0),
+        destination=apt.position,
+        speed=t.approach_speed,
+        cruise_altitude=1800.0,
+        fleet=t,
+    )
+    ac.runway = rw
+    ac.dest_airport = apt
+    ac.phase = FINAL
+    ac.heading = rw.heading
+    assert ac._final_alt() < ac.position[2]
+    assert ac.steer_velocity()[2] < 0.0
+
+
+def test_active_runway_favours_headwind():
+    airspace = Airspace()
+    apt = airspace.airports[0]
+    apt._ensure_runways()
+    r1, r2 = apt.runways
+    eastward = (7.0, 0.0, 0.0)
+    assert r2.into_wind_rating(eastward) > r1.into_wind_rating(eastward)
+    assert apt.active_runway(eastward).rid == r2.rid
+    westward = (-7.0, 0.0, 0.0)
+    assert apt.active_runway(westward).rid == r1.rid
+
+
+def test_airport_snapshot_includes_runways_and_hub():
+    airspace = Airspace()
+    apt = airspace.airports[0]
+    s = apt.snapshot()
+    assert s["hub"] is True
+    assert len(s["runways"]) >= 2
+    assert all(r["id"] and r["heading_label"] and r["length"] > 0 for r in s["runways"])
+
+
+def test_aircraft_snapshot_exposes_phase_and_runways():
+    airspace = Airspace()
+    apt = airspace.airports[0]
+    rw = apt.active_runway()
+    ac = Aircraft(
+        "S1",
+        rw.threshold,
+        destination=apt.position,
+        speed=0.0,
+        cruise_altitude=1500.0,
+        fleet=TYPES[REGIONAL],
+    )
+    ac.runway = rw
+    ac.dep_runway = rw
+    ac.phase = ROLLOUT
+    s = ac.snapshot()
+    assert s["phase"] == ROLLOUT
+    assert s["type"] == TYPES[REGIONAL].name
+    assert s["wake"] == TYPES[REGIONAL].wake
+    assert s["runway"] == rw.rid
+    assert s["dep_runway"] == rw.rid
+    assert s["state"] == "held"
