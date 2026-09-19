@@ -23,6 +23,26 @@ The simulator is designed as a **failure-injection laboratory**: deliberately br
 
 ## Quick Start
 
+### Run everything (one command)
+
+The backend serves the built SPA, REST API and WebSocket on a single port, so
+one command runs the whole stack. A frontend build runs automatically the first
+time (and whenever `frontend/dist` is missing); use `--build` to force one.
+
+```bash
+# one command → UI + API + socket on http://127.0.0.1:8000/
+python start.py
+python start.py --aircraft 100 --port 9000   # tune the sim / port
+```
+
+For frontend development with live reload, a dev launcher runs the backend and
+Vite together (Vite proxies `/api` and `/ws` to the backend):
+
+```bash
+# one command → UI on http://localhost:5173 (hot reload) + API on :8000
+python start_dev.py
+```
+
 ### Backend (headless)
 
 ```bash
@@ -33,7 +53,7 @@ python -m pip install -r backend/requirements.txt
 python -m backend.run --aircraft 60 --seconds 15
 ```
 
-### Backend (server + API)
+### Backend (server + API only)
 
 ```bash
 python -m backend.run --serve --aircraft 60 --port 8000
@@ -41,25 +61,13 @@ python -m backend.run --serve --aircraft 60 --port 8000
 # → ws://127.0.0.1:8000/ws        (live state stream)
 ```
 
-### Frontend (single-server build)
+### Frontend (build manually, if you prefer)
 
 ```bash
 cd frontend
 npm install
 npm run build          # produces frontend/dist
-cd ..
-python -m backend.run --serve --aircraft 60 --tick-rate 12 --sim-speed 1.0
-# → http://127.0.0.1:8000/     (production build served by the backend)
-# → http://127.0.0.1:8000/docs  (Swagger UI)
-```
-
-When `frontend/dist` exists, the backend serves the built SPA at `/` (FastAPI `StaticFiles`), so a single process runs the whole stack. For frontend development, run Vite separately instead:
-
-```bash
-cd frontend
-npm install
-npm run dev
-# → http://localhost:5173  (proxies /api and /ws to port 8000)
+npm run dev            # dev server on http://localhost:5173 (proxies /api, /ws)
 ```
 
 ![SkyMesh 3D visualization](docs/screenshot.png)
