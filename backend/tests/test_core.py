@@ -5,8 +5,10 @@ from __future__ import annotations
 import math
 import pytest
 
+from types import SimpleNamespace
+
 from backend.simulation import physics
-from backend.simulation.aircraft import Aircraft
+from backend.simulation.aircraft import Aircraft, CRUISE
 from backend.simulation.airspace import Airspace
 from backend.simulation.conflict import ConflictDetector
 from backend.simulation.negotiation import decide_winner, proposal_consensus_response
@@ -179,6 +181,60 @@ def test_close_airport_marks_one_closed():
     assert closed is not None
     assert closed.closed is True
     assert sum(1 for a in airspace.airports if a.closed) == 1
+
+
+def test_close_airport_diverts_airborne_flights():
+    from backend.engine.simulator import Simulator
+
+    sim = Simulator()
+    port = sim.airspace.airport_by_id("APT1")
+    ac = Aircraft(
+        aircraft_id="D1",
+        position=(port.position[0], port.position[1], 3000.0),
+        destination=port.position,
+        speed=180.0,
+        cruise_altitude=3000.0,
+    )
+    ac.phase = CRUISE
+    ac.dest_aid = "APT1"
+    ac.runway = sim.airspace.pick_runway(port)
+    sim.agents.append(
+        SimpleNamespace(aircraft=ac, _reset_leg_flags=lambda: None)
+    )
+
+    target = sim.close_airport("APT1")
+    assert target is not None and target.aid == "APT1"
+    assert target.closed is True
+    assert ac.dest_aid != "APT1"
+    assert ac.phase == CRUISE
+    new_port = sim.airspace.airport_by_id(ac.dest_aid)
+    assert new_port is not None and not new_port.closed
+    assert ac.destination == new_port.position
+    assert ac.runway is not None and ac.runway in new_port.runways
+    assert ac.plan is None and ac.pending_plan is None
+
+
+def test_close_airport_leaves_grounded_flights_alone():
+    from backend.engine.simulator import Simulator
+
+    sim = Simulator()
+    port = sim.airspace.airport_by_id("APT2")
+    ac = Aircraft(
+        aircraft_id="G1",
+        position=port.position,
+        destination=port.position,
+        speed=0.0,
+    )
+    ac.phase = "parked"
+    ac.dest_aid = "APT2"
+    sim.agents.append(
+        SimpleNamespace(aircraft=ac, _reset_leg_flags=lambda: None)
+    )
+
+    target = sim.close_airport("APT2")
+    assert target is not None and target.aid == "APT2"
+    assert ac.dest_aid == "APT2"
+    assert ac.phase == "parked"
 
 
 def test_aircraft_descends_into_low_airport_nearby():
@@ -407,6 +463,82 @@ def test_aircraft_full_departure_sequence():
     assert {"taxi_out", "line_up", "takeoff", "climbout", "climb"} <= phases
     assert ac.phase == CRUISE
     assert ac.position[2] >= ac.cruise_altitude - 25.0
+
+
+def test_runway_departure_hold_point_off_the_asphalt():
+    airspace = Airspace()
+    rw = airspace.airports[0].active_runway()
+    nx, ny = rw.n
+    ux, uy = rw.u
+    dp = rw.departure_point()
+    held = rw.departure_hold_point(0)
+    assert held[2] == pytest.approx(rw.elevation)
+    perp = (held[0] - dp[0]) * nx + (held[1] - dp[1]) * ny
+    along = (held[0] - dp[0]) * ux + (held[1] - dp[1]) * uy
+    assert perp == pytest.approx(rw.HOLD_OFFSET)
+    assert along == pytest.approx(0.0, abs=1e-6)
+    # Deep enough off the centreline to never sit on the asphalt.
+    assert abs(perp) > rw.width / 2 + 20.0
+    # Queued slots stagger back along the taxiway, clear of each other.
+    held1 = rw.departure_hold_point(1)
+    assert (
+        (held1[0] - held[0]) * ux + (held1[1] - held[1]) * uy
+        == pytest.approx(-rw.HOLD_STAGGER)
+    )
+    assert held1 != held
+
+
+def test_aircraft_holds_off_runway_until_cleared():
+    airspace = Airspace()
+    dep = airspace.airports[0]
+    dest = airspace.airports[1]
+    rw = dep.active_runway()
+    hold = rw.departure_hold_point(0)
+    ac = Aircraft(
+        "D1",
+        (hold[0], hold[1], hold[2]),
+        destination=dest.position,
+        speed=0.0,
+        cruise_altitude=1500.0,
+        fleet=TYPES[REGIONAL],
+    )
+    ac.dep_runway = rw
+    ac.runway = rw
+    ac.phase = TAXI_OUT
+    ac.hold_point = (hold[0], hold[1], hold[2])
+    nx, ny = rw.n
+
+    # Tower has not cleared the departure: it must stay off the runway.
+    for _ in range(6000):
+        if ac.phase == LINE_UP:
+            break
+        ac.advance(1.0)
+    assert ac.phase == TAXI_OUT
+    d_centreline = abs(
+        (ac.position[0] - rw.threshold[0]) * nx
+        + (ac.position[1] - rw.threshold[1]) * ny
+    )
+    assert d_centreline > rw.width / 2 + 20.0
+
+    # Once cleared it lines up, rolls and climbs away.
+    ac.line_up_cleared = True
+    phases: set[str] = {ac.phase}
+    for _ in range(6000):
+        phases.add(ac.phase)
+        ac.advance(1.0)
+        if ac.phase == CRUISE:
+            break
+    assert {"line_up", "takeoff", "climbout", "climb"} <= phases
+    assert ac.phase == CRUISE
+    assert ac.line_up_cleared is True
+
+
+def test_dense_default_aircraft_and_airborne_fraction():
+    from backend.engine.simulator import SimConfig
+
+    cfg = SimConfig()
+    assert cfg.num_aircraft >= 100
+    assert 0.0 < cfg.airborne_fraction <= 1.0
 
 
 def test_aircraft_descent_enters_downwind_near_runway():

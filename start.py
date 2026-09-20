@@ -27,7 +27,7 @@ FRONTEND_DIST = os.path.join(ROOT, "frontend", "dist", "index.html")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SkyMesh all-in-one launcher")
     p.add_argument("--build", action="store_true", help="force a frontend rebuild")
-    p.add_argument("--aircraft", type=int, default=60, help="number of aircraft")
+    p.add_argument("--aircraft", type=int, default=120, help="number of aircraft")
     p.add_argument("--tick-rate", type=float, default=12.0, help="simulation ticks/sec")
     p.add_argument("--sim-speed", type=float, default=1.0, help="time multiplier")
     p.add_argument("--host", default="127.0.0.1", help="server host")

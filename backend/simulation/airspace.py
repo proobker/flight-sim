@@ -4,14 +4,26 @@ from __future__ import annotations
 
 import math
 import random
+import statistics
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from .fleet import AircraftType
 from . import physics
-from .terrain import TERRAIN_MIN_CLEARANCE, TerrainGrid
+from .terrain import TERRAIN_MIN_CLEARANCE, TerrainGrid, flatten_airports, relief_mesh, terrace_radii
 
 AIRPORT_NAMES = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"]
+
+# Random airport placement: keep the fields spaced like a metroplex, and never
+# let a terraced plateau land up in the mountains (planes cruise 1500-4000 m
+# and the terrain is real). The hub keeps more freedom than the relievers, and
+# the retry loop reseeds its RNG each attempt, so a fixed terrain_seed always
+# reproduces the same layout.
+_PLACEMENT_TRIES = 20
+_PLATEAU_CAP_HUB = 3800.0
+_PLATEAU_CAP_RELIEF = 2600.0
 
 # Discrete cruise levels so neighbouring flights sit in different bands.
 # Now real-ish RVSM-scale levels for a 160 km terminal area.
@@ -56,6 +68,24 @@ class Runway:
     def departure_point(self) -> tuple[float, float, float]:
         ux, uy = self.u
         return (self.threshold[0] - ux * self.length, self.threshold[1] - uy * self.length, self.elevation)
+
+    # Parallel taxiway: how far off the runway centreline the hold pads sit,
+    # and the spacing back along the runway between queued departures.
+    HOLD_OFFSET = 150.0
+    HOLD_STAGGER = 120.0
+
+    def departure_hold_point(self, slot: int = 0) -> tuple[float, float, float]:
+        """Off-runway hold pad for a departure, on the pattern side of the
+        runway just beyond the departing end. `slot` spreads the queue back
+        along the taxiway so waiting aircraft never sit on the asphalt."""
+        ux, uy = self.u
+        nx, ny = self.n
+        x, y, z = self.departure_point()
+        return (
+            x + nx * self.HOLD_OFFSET - ux * slot * self.HOLD_STAGGER,
+            y + ny * self.HOLD_OFFSET - uy * slot * self.HOLD_STAGGER,
+            z,
+        )
 
     def approach_fix(self, final_len: float) -> tuple[float, float, float]:
         """Straight-on point on the extended centerline, before the threshold."""
@@ -230,28 +260,53 @@ class Airspace:
         self.ceiling = ceiling
         self.wind = wind
         self.obstacles: list[Obstacle] = []
-        self.airports: list[Airport] = airports if airports is not None else self._default_airports()
+        self.airports: list[Airport] = (
+            airports if airports is not None else self._default_airports(self._layout_rng(terrain_seed))
+        )
+        self._airports_defaulted = airports is None
         for a in self.airports:
             self.add_runways_for(a)
         self.terrain = terrain
         if self.terrain is None and terrain_seed is not None:
-            self.terrain = TerrainGrid.from_airspace(self, seed=terrain_seed)
+            if self._airports_defaulted:
+                self.terrain = self._build_accepted_terrain(seed=terrain_seed)
+            else:
+                self.terrain = TerrainGrid.from_airspace(self, seed=terrain_seed)
         self._next_obs = 0
 
-    def _default_airports(self) -> list[Airport]:
-        """Six strings spread over the (scaled) field: one hub near centre plus
-        reliever fields around it, so the terminal-area scale reads like a
-        metroplex rather than six pads stacked corner-to-corner."""
+    @staticmethod
+    def _layout_rng(terrain_seed: int | None) -> random.Random:
+        # Seeded → every launch with the same seed shows the same random layout
+        # (tests and vertical slice depend on it). No seed → fresh spots a run.
+        return random.Random(seed) if (seed := terrain_seed) is not None else random.Random()
+
+    def _default_airports(self, rng: random.Random) -> list[Airport]:
+        """Six fields: one hub near centre (slight jitter) plus reliever fields
+        at random spots, spaced like a metroplex across the field."""
         w, d = self.width, self.depth
+        margin = 0.08
         cx, cy = w * 0.5, d * 0.5
         spots = [
-            (cx, cy, True),  # ALPHA — the hub
-            (w * 0.22, d * 0.30, False),
-            (w * 0.80, d * 0.22, False),
-            (w * 0.24, d * 0.78, False),
-            (w * 0.78, d * 0.80, False),
-            (w * 0.60, d * 0.55, False),
+            (
+                cx + rng.uniform(-0.03, 0.03) * w,
+                cy + rng.uniform(-0.03, 0.03) * d,
+                True,
+            )
         ]
+        min_sep = min(w, d) * 0.2
+        attempts = 0
+        while len(spots) < 6:
+            attempts += 1
+            if attempts > 1500:  # soften the spacing only if the field is full
+                min_sep *= 0.95
+                attempts = 0
+            cand = (
+                rng.uniform(margin, 1.0 - margin) * w,
+                rng.uniform(margin, 1.0 - margin) * d,
+                False,
+            )
+            if all(math.hypot(cand[0] - sx, cand[1] - sy) >= min_sep for sx, sy, _ in spots):
+                spots.append(cand)
         pads: list[Airport] = []
         for i, (x, y, hub) in enumerate(spots):
             pads.append(
@@ -264,6 +319,70 @@ class Airspace:
                 )
             )
         return pads
+
+    def _build_accepted_terrain(self, seed: int) -> TerrainGrid:
+        """Build the flat-terraced terrain, re-picking the random layout until
+        every plateau stays low and grades sanely against its surroundings.
+
+        The raw relief mesh is generated once; each candidate layout is screened
+        with the cheap PURE flatten (no airport mutation, no full rebuild), and
+        every attempt gets its own layout RNG so rejected layouts actually
+        change. Deterministic for a given seed: the per-attempt seeds are
+        derived from it, so the whole sequence replays exactly."""
+        raw, xs, ys, x0, y0, cell = relief_mesh(self, seed)
+        for attempt in range(_PLACEMENT_TRIES):
+            h, elevs = flatten_airports(raw, xs, ys, self)
+            if self._layout_acceptable(h, elevs, x0, y0, cell):
+                # Commit: patch plateau elevations onto airports + runways.
+                for apt, elev in zip(self.airports, elevs):
+                    ax, ay, _ = apt.position
+                    apt.position = (ax, ay, float(elev))
+                    for r in apt.runways or []:
+                        r.elevation = float(elev)
+                        tx, ty, _ = r.threshold
+                        r.threshold = (tx, ty, float(elev))
+                return TerrainGrid(
+                    grid=np.ascontiguousarray(h, dtype=np.float32),
+                    x0=x0,
+                    y0=y0,
+                    cell=cell,
+                    zmin=float(h.min()),
+                    zmax=float(h.max()),
+                    bounds=(0.0, 0.0, self.width, self.depth),
+                )
+            self.airports = self._default_airports(self._layout_rng(seed + attempt + 1))
+            for a in self.airports:
+                self.add_runways_for(a)
+        # No layout met every cap (pathological seed) — fall back to the last
+        # candidate rather than fail startup; the plateau caps are a preference.
+        return TerrainGrid.from_airspace(self, seed=seed)
+
+    def _layout_acceptable(self, h, elevs, x0, y0, cell) -> bool:
+        """Screen a flattened grid: plateau within per-airport caps, and not
+        far from the ring just beyond the rim (outliers — mountain wedges —
+        can't skew the robust median)."""
+        def sample(px, py):
+            ix = int(np.clip((px - x0) / cell, 0, h.shape[1] - 1))
+            iy = int(np.clip((py - y0) / cell, 0, h.shape[0] - 1))
+            return h[iy][ix]
+
+        for apt, elev in zip(self.airports, elevs):
+            cap = _PLATEAU_CAP_HUB if apt.hub else _PLATEAU_CAP_RELIEF
+            if elev > cap:
+                return False
+            _, R_out = terrace_radii(apt)
+            ring_r = R_out * 1.3
+            ring = [
+                sample(
+                    apt.position[0] + math.cos(k * 2 * math.pi / 64) * ring_r,
+                    apt.position[1] + math.sin(k * 2 * math.pi / 64) * ring_r,
+                )
+                for k in range(64)
+            ]
+            med = statistics.median(ring)
+            if not (med - 250.0 <= elev <= med + 550.0):
+                return False
+        return True
 
     def pick_runway(self, airport: Airport) -> Runway:
         """The arrival runway an inbound flight will be assigned."""

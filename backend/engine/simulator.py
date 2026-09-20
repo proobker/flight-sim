@@ -15,7 +15,7 @@ from typing import Any
 
 from ..network.udp_node import UdpNode
 from ..simulation import physics
-from ..simulation.aircraft import Aircraft
+from ..simulation.aircraft import Aircraft, CRUISE
 from ..simulation.airspace import Airspace, random_cruise_altitude
 from ..simulation.conflict import ConflictDetector
 from ..simulation.fleet import assign_type
@@ -29,7 +29,8 @@ WIND = (-7.0, -3.5, 0.0)
 
 @dataclass
 class SimConfig:
-    num_aircraft: int = 40
+    num_aircraft: int = 120
+    airborne_fraction: float = 0.65
     tick_rate: float = 12.0
     sim_speed: float = 1.0
     airspace_width: float = 160000.0
@@ -92,42 +93,86 @@ class Simulator:
         self._snapshot_callbacks.append(callback)
 
     # ----- spawn / kill -----
-    async def _spawn_aircraft(self, count: int) -> None:
+    async def _spawn_aircraft(self, count: int = 0) -> None:
+        """Fill the world: `airborne_fraction` of the fleet is already in the
+        air (cruise/descent feeding the pattern flows) so traffic is dense
+        from t=0; the rest queue on hold pads waiting for runway clearance."""
+        count = count or self.config.num_aircraft
+        airborne = int(count * self.config.airborne_fraction)
         for _ in range(count):
             aid = f"A{next(self._next_id):03d}"
-            start = self.airspace.random_airport(self._rng)
-            dest_airport = self.airspace.random_airport(self._rng, exclude_id=start.aid)
-            dep_rwy = start.active_runway(self.airspace.wind)
-            dest_rwy = self.airspace.pick_runway(dest_airport)
-            fleet = assign_type(self._rng, hub=start.hub)
-            pos, heading = self._departure_spot(dep_rwy)
-            ac = Aircraft(
-                aircraft_id=aid,
-                position=pos,
-                destination=dest_airport.position,
-                speed=0.0,
-                heading=heading,
-                cruise_altitude=random_cruise_altitude(self._rng),
-                priority=random.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
-                fleet=fleet,
-            )
-            ac.phase = "taxi_out"
-            ac.dep_runway = dep_rwy
-            ac.runway = dest_rwy
-            ac.dest_airport = dest_airport
-            ac.origin_aid = start.aid
-            ac.dest_aid = dest_airport.aid
-            ac.leg_distance = physics.h_distance(pos, dest_airport.position)
-            self._wire_agent(ac, start)
-            self._spawned += 1
+            if airborne > 0:
+                airborne -= 1
+                self._spawn_airborne(aid)
+            else:
+                self._spawn_ground(aid)
 
-    def _departure_spot(self, runway) -> tuple[tuple[float, float, float], float]:
-        """A taxi-out start just past the departure end, staggered a little."""
-        ux, uy = runway.u
-        back = self._rng.uniform(30.0, 260.0)
-        px = runway.threshold[0] - ux * runway.length - ux * back
-        py = runway.threshold[1] - uy * runway.length - uy * back
-        return (px, py, runway.elevation), runway.heading
+    def _spawn_ground(self, aid: str) -> None:
+        """A departure waiting at the off-runway hold pad of its departure
+        runway; the tower clears it into the runway when the arrival flow
+        allows."""
+        start = self.airspace.random_airport(self._rng)
+        dest_airport = self.airspace.random_airport(self._rng, exclude_id=start.aid)
+        dep_rwy = start.active_runway(self.airspace.wind)
+        dest_rwy = self.airspace.pick_runway(dest_airport)
+        fleet = assign_type(self._rng, hub=start.hub)
+        slot = int(aid[-1]) % 4
+        hold = dep_rwy.departure_hold_point(slot)
+        hold = (hold[0], hold[1], dep_rwy.elevation)
+        ac = Aircraft(
+            aircraft_id=aid,
+            position=hold,
+            destination=dest_airport.position,
+            speed=0.0,
+            heading=dep_rwy.heading,
+            cruise_altitude=random_cruise_altitude(self._rng),
+            priority=random.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
+            fleet=fleet,
+        )
+        ac.phase = "taxi_out"
+        ac.hold_point = hold
+        ac.dep_runway = dep_rwy
+        ac.runway = dest_rwy
+        ac.dest_airport = dest_airport
+        ac.origin_aid = start.aid
+        ac.dest_aid = dest_airport.aid
+        ac.leg_distance = physics.h_distance(hold, dest_airport.position)
+        self._wire_agent(ac, start)
+        self._spawned += 1
+
+    def _spawn_airborne(self, aid: str) -> None:
+        """A flight already in the air, headed for the pattern of its runway."""
+        start = self.airspace.random_airport(self._rng)
+        dest_port = self.airspace.random_airport(self._rng, exclude_id=start.aid)
+        dest_rwy = self.airspace.pick_runway(dest_port)
+        fleet = assign_type(self._rng, hub=dest_port.hub)
+        dest = dest_port.position
+        ang = self._rng.uniform(0.0, 2.0 * math.pi)
+        dist = self._rng.uniform(22000.0, 65000.0)
+        px = dest[0] + math.cos(ang) * dist
+        py = dest[1] + math.sin(ang) * dist
+        px, py, _ = self.airspace.enforce_bounds((px, py, self.config.cruise_altitude))
+        altitude = random_cruise_altitude(self._rng)
+        heading = math.atan2(dest[0] - px, dest[1] - py)
+        ac = Aircraft(
+            aircraft_id=aid,
+            position=(px, py, altitude),
+            destination=dest,
+            speed=fleet.cruise_speed,
+            heading=heading,
+            cruise_altitude=altitude,
+            priority=random.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
+            fleet=fleet,
+        )
+        ac.phase = "descent" if physics.h_distance((px, py, altitude), dest) < 36000.0 else CRUISE
+        ac.runway = dest_rwy
+        ac.dest_airport = dest_port
+        ac.origin_aid = start.aid
+        ac.dest_aid = dest_port.aid
+        ac.leg_distance = max(1.0, physics.h_distance((px, py, altitude), dest))
+        ac.leg_travelled = self._rng.uniform(0.0, ac.leg_distance * 0.9)
+        self._wire_agent(ac)
+        self._spawned += 1
 
     def _wire_agent(self, ac: Aircraft, port=None) -> None:
         aid = ac.id
@@ -243,8 +288,50 @@ class Simulator:
             )
         self.airspace.add_obstacle("STORM", center, 1500.0, 4000.0)
 
-    def close_airport(self) -> None:
-        self.airspace.close_airport()
+    def close_airport(self, aid: str | None = None):
+        """Close an airport and divert every airborne flight bound for it.
+
+        Grounded traffic (parked/taxiing) is left alone: those crews pick an
+        open field for their next leg via ``random_airport`` already. Anything
+        in the air — cruise, descent, even mid-pattern — is rerouted to a new
+        open destination so the closed field never receives another landing.
+        """
+        target = self.airspace.close_airport(aid)
+        if target is None:
+            return None
+        for agent in self.agents:
+            ac = agent.aircraft
+            if not ac.active:
+                continue
+            if ac.dest_aid != target.aid:
+                continue
+            if ac.is_grounded():
+                continue
+            self._divert(ac, agent)
+        return target
+
+    def _divert(self, ac: Aircraft, agent) -> None:
+        """Re-target an airborne aircraft onto a fresh open airport."""
+        dest_port = self.airspace.random_airport(exclude_id=ac.dest_aid)
+        ac.dest_aid = dest_port.aid
+        ac.dest_airport = dest_port
+        ac.destination = dest_port.position
+        ac.runway = self.airspace.pick_runway(dest_port)
+        ac.leg_distance = max(1.0, physics.h_distance(ac.position, dest_port.position))
+        ac.leg_travelled = 0.0
+        ac.waypoint = None
+        ac.terrain_wp = None
+        ac.terrain_climb_target = None
+        ac.terrain_detour = False
+        ac.plan = None
+        ac.pending_plan = None
+        ac.proposal_pending_to = None
+        ac.go_around = False
+        ac.join_final = False
+        ac.downwind_extension = 0.0
+        ac.line_up_cleared = False
+        ac.phase = CRUISE
+        agent._reset_leg_flags()
 
     async def add_nofly(self, center=None) -> None:
         if center is None:

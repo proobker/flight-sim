@@ -92,6 +92,135 @@ def _segment_distances(points, segs):
     return best
 
 
+# Matches the frontend AIRPORT_SITE_SCALE in SkyScene.ts. The site visuals are
+# scaled ~2x — the apron ring reaches radius * 1.2 * scale — so the flat
+# terrace must cover pad, apron, beacon ring and the full runway length, with a
+# little margin left under the graded rim.
+AIRPORT_SITE_SCALE = 2.0
+
+
+def terrace_radii(apt) -> tuple[float, float]:
+    """(R_flat, R_out) for an airport: exact-flat out to R_flat, then smoothly
+    graded back to raw relief across the rim (R_flat → R_out)."""
+    runway_reach = max((0.55 * r.length for r in (apt.runways or [])), default=0.0)
+    R_flat = max(apt.radius * (1.2 * AIRPORT_SITE_SCALE) + 300.0, runway_reach + 800.0, 2800.0)
+    R_out = R_flat + max(apt.radius * 1.1, 1800.0)
+    return R_flat, R_out
+
+
+def _raw_relief(xs, ys, cx, cy, seed) -> np.ndarray:
+    """Base relief (steps 1-3 of the grid build) evaluated at arbitrary points.
+    Resets the RNG from `seed` exactly like the full build, so point samples
+    agree with the grid: landing fields can be pre-screened cheaply before the
+    one expensive flattened rebuild."""
+    rng = np.random.default_rng(seed)
+    lx = xs - cx
+    ly = ys - cy
+
+    # 1) Coastal plain with soft rolling relief.
+    base = 200.0 + 150.0 * (_noise_field(lx, ly, rng, 5200.0, 4, "fbm") - 0.5)
+
+    # 2) Mountain massif: overlapping ridged spines rising to the NE.
+    def spine(angle, width, amp, along_scale):
+        c = math.cos(angle)
+        s = math.sin(angle)
+        across = -lx * s + ly * c
+        along = lx * c + ly * s
+        band = np.exp(-((across / width) ** 2) / 2.0)
+        rn = _noise_field(along, across, rng, along_scale, 4, "ridged")
+        return band * amp * (0.28 + 0.72 * rn)
+
+    mountains = (
+        spine(-0.65, 11000.0, 3600.0, 9000.0)  # main SW↔NE range through the east
+        + spine(0.60, 8000.0, 1800.0, 7000.0)  # secondary NW↔SE range
+        + spine(1.75, 5500.0, 1000.0, 6000.0)  # perimeter foothills
+    )
+
+    # 3) Valley system carved through the lowlands (airports nest here).
+    valley_poly = [
+        (40.0, 60.0),
+        (60.0, 52.0),
+        (80.0, 80.0),
+        (100.0, 92.0),
+        (120.0, 105.0),
+    ]
+    valley_segs = [(x * 1000.0, y * 1000.0) for x, y in valley_poly]
+    pts = np.column_stack([np.asarray(xs).ravel(), np.asarray(ys).ravel()])
+    vdist = _segment_distances(pts, valley_segs).reshape(np.asarray(xs).shape)
+    valley = 470.0 * np.exp(-((vdist / 12000.0) ** 2))
+
+    h = base + mountains - valley
+    return np.clip(h, _ZMIN, _ZMAX)
+
+
+def relief_mesh(airspace, seed: int = 1337, cell: float = _DEFAULT_CELL):
+    """Grid geometry + RAW relief for an airspace (steps 1-3, un-flattened).
+
+    Returns (h, xs, ys, x0, y0, cell). The airspace layout pre-screen builds
+    this once and runs the cheap pure `flatten_airports` per candidate layout;
+    the authoritative build (`from_airspace`) uses the exact same mesh.
+    """
+    cx, cy = airspace.width / 2.0, airspace.depth / 2.0
+    half = max(airspace.width, airspace.depth) / 2.0 * (1.0 + _EDGE_MARGIN)
+    extent = half * 2.0
+    W = int(round(extent / cell)) + 1
+    x0 = cx - half
+    y0 = cy - half
+    j, i = np.mgrid[0:W, 0:W]
+    xs = x0 + i * cell
+    ys = y0 + j * cell
+    return _raw_relief(xs, ys, cx, cy, seed), xs, ys, x0, y0, cell
+
+
+def flatten_airports(h, xs, ys, airspace):
+    """Pure flatten: raise each airport onto a genuinely FLAT terrace that
+    covers pad, apron, beacon ring and full runway length, then grade only the
+    rim (R_flat → R_out) back up toward the surrounding relief.
+
+    Returns (flattened grid, plateau elevations per airport, in airport order).
+    Does NOT mutate the airports or runways — callers patch their elevations
+    once they commit to a layout, which lets the layout screen run this cheaply
+    per candidate."""
+
+    # Sample window beyond the graded rim: the doubly-bounded annulus is the
+    # "surrounding's height". A one-sided ramp (> 0.5) would sweep in the whole
+    # airspace and collapse every plateau onto the global mean.
+    pts = np.column_stack([xs.ravel(), ys.ravel()])
+    LIP = 100.0
+    elevs: list[float] = []
+    for apt in airspace.airports:
+        ax, ay, _ = apt.position
+        R_flat, R_out = terrace_radii(apt)
+        d = np.hypot(xs - ax, ys - ay)
+
+        surrounding = h[(d >= R_out * 1.15) & (d <= R_out * 1.45)]
+        plateau = (
+            float(np.mean(surrounding)) + LIP
+            if surrounding.size
+            else float(h.max())
+        )
+        elevs.append(plateau)
+
+        # Weight 0 for the entire flat terrace (terrain == elev exactly),
+        # rising smoothly to 1 (raw relief) only across the outer rim.
+        w = _smooth(np.clip((d - R_flat) / max(R_out - R_flat, 1.0), 0.0, 1.0))
+        h = h * w + plateau * (1.0 - w)
+
+        # Flatten the arrival corridor ahead of the runway too.
+        for r in apt.runways or []:
+            u = r.u
+            p0x = r.threshold[0] - u[0] * 10000.0
+            p0y = r.threshold[1] - u[1] * 10000.0
+            p1x = r.threshold[0] + u[0] * 2000.0
+            p1y = r.threshold[1] + u[1] * 2000.0
+
+            dseg = _segment_distances(pts, [(p0x, p0y), (p1x, p1y)]).reshape(xs.shape)
+            wseg = _smooth(np.clip(dseg / 1500.0, 0.0, 1.0))
+            h = h * wseg + plateau * (1.0 - wseg)
+
+    return h, elevs
+
+
 @dataclass
 class TerrainGrid:
     """Discrete elevation model indexed by grid cell (row = y, col = x)."""
@@ -109,109 +238,20 @@ class TerrainGrid:
     @classmethod
     def from_airspace(cls, airspace, seed: int = 1337, cell: float = _DEFAULT_CELL) -> "TerrainGrid":
         """Build the terrain around an airspace, flattening its airports."""
-        cx, cy = airspace.width / 2.0, airspace.depth / 2.0
-        half = max(airspace.width, airspace.depth) / 2.0 * (1.0 + _EDGE_MARGIN)
-        extent = half * 2.0
-        W = int(round(extent / cell)) + 1
-        N = W
-        x0 = cx - half
-        y0 = cy - half
+        h, xs, ys, x0, y0, _ = relief_mesh(airspace, seed, cell)
+        h, elevs = flatten_airports(h, xs, ys, airspace)
+        h = np.ascontiguousarray(h, dtype=np.float32)
 
-        j, i = np.mgrid[0:N, 0:N]
-        xs = x0 + i * cell
-        ys = y0 + j * cell
-        lx = xs - cx
-        ly = ys - cy
-
-        rng = np.random.default_rng(seed)
-
-        # 1) Coastal plain with soft rolling relief.
-        base = 200.0 + 150.0 * (_noise_field(lx, ly, rng, 5200.0, 4, "fbm") - 0.5)
-
-        # 2) Mountain massif: overlapping ridged spines rising to the NE.
-        def spine(angle, width, amp, along_scale):
-            c = math.cos(angle)
-            s = math.sin(angle)
-            across = -lx * s + ly * c
-            along = lx * c + ly * s
-            band = np.exp(-((across / width) ** 2) / 2.0)
-            rn = _noise_field(along, across, rng, along_scale, 4, "ridged")
-            return band * amp * (0.28 + 0.72 * rn)
-
-        mountains = (
-            spine(-0.65, 11000.0, 3600.0, 9000.0)  # main SW↔NE range through the east
-            + spine(0.60, 8000.0, 1800.0, 7000.0)  # secondary NW↔SE range
-            + spine(1.75, 5500.0, 1000.0, 6000.0)  # perimeter foothills
-        )
-
-        # 3) Valley system carved through the lowlands (airports nest here).
-        valley_poly = [
-            (40.0, 60.0),
-            (60.0, 52.0),
-            (80.0, 80.0),
-            (100.0, 92.0),
-            (120.0, 105.0),
-        ]
-        valley_segs = [(x * 1000.0, y * 1000.0) for x, y in valley_poly]
-        pts = np.column_stack([xs.ravel(), ys.ravel()])
-        vdist = _segment_distances(pts, valley_segs).reshape(xs.shape)
-        valley = 470.0 * np.exp(-((vdist / 12000.0) ** 2))
-
-        h = base + mountains - valley
-        h = np.clip(h, _ZMIN, _ZMAX)
-        h = h.astype(np.float32)
-
-        # 4) Raise each airport onto a flat terrace at the *surrounding*
-        # terrain height, so fields sit clearly above the default base floor
-        # instead of being sunk into a valley. A small lip makes the plateau
-        # read as a distinct promontory. Airport and runway elevations are
-        # patched to the plateau so the physics, terminal patterns and the
-        # visual airport all agree with the ground beneath them.
-        LIP = 100.0
-        for apt in airspace.airports:
+        # Patch the plateau elevations onto every airport + runway so physics,
+        # terminal patterns and the visual airport all agree with the ground
+        # beneath them.
+        for apt, elev in zip(airspace.airports, elevs):
             ax, ay, _ = apt.position
-            R = max(apt.radius * 2.4, 2800.0)
-            d = np.hypot(xs - ax, ys - ay)
-            w = _smooth(np.clip(d / R, 0.0, 1.0))
-
-            # Sample the un-flattened relief in an annulus just beyond the
-            # flatten radius — that is the "surrounding's height". The window
-            # must be doubly bounded: a one-sided ramp `> 0.5` would sweep in
-            # the *entire* airspace past 1.5 R, collapsing every plateau onto
-            # the global mean.
-            surrounding = h[(d >= R * 1.5) & (d <= R * 1.75)]
-            plateau = (
-                float(np.mean(surrounding)) + LIP
-                if surrounding.size
-                else float(h.max())
-            )
-            elev = np.float32(plateau)
-
-            # Patch the airport platform + runway elevations so every layer
-            # (physics, tower, plane spawns/landings, frontend) shares the
-            # plateau height.
             apt.position = (ax, ay, float(elev))
-            h = h * w + elev * (1.0 - w)
             for r in apt.runways or []:
                 r.elevation = float(elev)
                 tx, ty, _ = r.threshold
                 r.threshold = (tx, ty, float(elev))
-
-                u = r.u
-                p0x = r.threshold[0] - u[0] * 10000.0
-                p0y = r.threshold[1] - u[1] * 10000.0
-                p1x = r.threshold[0] + u[0] * 2000.0
-                p1y = r.threshold[1] + u[1] * 2000.0
-
-                dseg = _segment_distances(
-                    pts, [(p0x, p0y), (p1x, p1y)]
-                ).reshape(xs.shape)
-                wseg = _smooth(np.clip(dseg / 1500.0, 0.0, 1.0))
-                h = h * wseg + elev * (1.0 - wseg)
-
-        # The airport flattening above mixes float64 weights back in; re-cast
-        # so the exported grid is exactly float32 (see to_bytes).
-        h = np.ascontiguousarray(h, dtype=np.float32)
 
         return cls(
             grid=h,

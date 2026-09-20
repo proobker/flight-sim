@@ -407,7 +407,9 @@ class AircraftAgent:
         r = ac.runway
         dr = ac.dep_runway
 
-        if ac.phase == "line_up" and dr is not None and not ac.line_up_cleared:
+        if ac.phase in ("taxi_out", "line_up") and dr is not None and not ac.line_up_cleared:
+            # Cleared while waiting at the hold pad (or as a fallback while
+            # lining up) so departures never queue on the runway.
             ac.line_up_cleared = terminal.clear_for_departure(self.id, dr.rid, ac.type_.wake, now)
         elif ac.phase == "takeoff" and dr is not None:
             if not self._dep_noted:
@@ -487,10 +489,12 @@ class AircraftAgent:
         next_port = self.airspace.random_airport(exclude_id=port.aid)
         dep_rwy = port.active_runway(self.airspace.wind)
         dest_rwy = self.airspace.pick_runway(next_port)
-        px, py, _ = dep_rwy.departure_point()
+        slot = int(ac.id[-1]) % 4
+        hold = dep_rwy.departure_hold_point(slot)
+        ac.hold_point = (hold[0], hold[1], dep_rwy.elevation)
 
         ac.phase = "taxi_out"
-        ac.position = (px, py, dep_rwy.elevation)
+        ac.position = (hold[0], hold[1], dep_rwy.elevation)
         ac.dep_runway = dep_rwy
         ac.runway = dest_rwy
         ac.dest_airport = next_port
@@ -498,7 +502,7 @@ class AircraftAgent:
         ac.origin_aid = port.aid
         ac.dest_aid = next_port.aid
         ac.cruise_altitude = random_cruise_altitude()
-        ac.leg_distance = max(1.0, physics.h_distance(dep_rwy.departure_point(), next_port.position))
+        ac.leg_distance = max(1.0, physics.h_distance(ac.hold_point, next_port.position))
         ac.leg_travelled = 0.0
         ac.plan = None
         ac.heading = dep_rwy.heading

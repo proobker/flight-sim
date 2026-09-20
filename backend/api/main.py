@@ -179,9 +179,10 @@ async def add_storm():
 
 
 @app.post("/api/control/close_airport")
-async def close_airport():
-    get_sim().close_airport()
-    return {"ok": True}
+async def close_airport(data: dict[str, Any] | None = None):
+    aid = (data or {}).get("aid")
+    target = get_sim().close_airport(aid)
+    return {"ok": True, "aid": target.aid if target else None}
 
 
 @app.post("/api/control/add_nofly")

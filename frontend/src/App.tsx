@@ -41,6 +41,14 @@ export default function App() {
     sceneRef.current?.resetView();
   };
 
+  const handleCloseAirport = (aid: string) => {
+    fetch("/api/control/close_airport", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ aid }),
+    }).catch((e) => console.error("close airport failed", aid, e));
+  };
+
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative", overflow: "hidden" }}>
       <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
@@ -74,6 +82,7 @@ export default function App() {
             showTags={showTags}
             setShowTags={setShowTags}
             onReset={handleReset}
+            onCloseAirport={handleCloseAirport}
           />
           <ControlPanel />
         </>

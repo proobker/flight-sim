@@ -58,17 +58,37 @@ function clamp01(t: number): number {
   return t < 0 ? 0 : t > 1 ? 1 : t;
 }
 
-const NIGHT_SKY = { top: 0x071030, mid: 0x1a3050, bottom: 0x0e1818 };
-const DAY_SKY = { top: 0x2277cc, mid: 0x66bbee, bottom: 0xcceeff };
-const NIGHT_CLEAR = 0x0a0a1a;
-const DAY_CLEAR = 0x87ceeb;
-const NIGHT_FOG_DENSITY = 0.000022;
-const DAY_FOG_DENSITY = 0.000012;
+const NIGHT_FOG_COLOR = 0x0e1818;
+const DAY_FOG_COLOR = 0xcceeff;
 
-// The ground extends far beyond the sky dome and fog so its edge is never
-// visible — the world reads as endless.
-const GROUND_HALF_EXTENT = 160000;
+// The ground extends far beyond the camera's max zoom so its edge is never
+// visible — the world reads as endless even at the max zoom-out.
+const GROUND_HALF_EXTENT = 1200000;
 const GROUND_CLEARANCE = 80;
+
+// How high above the terrain surface airport buildings sit. The backend sits
+// the flattened field exactly AT every airport's base, so without this lift
+// the pad disc and terminal bed are coplanar with the heightfield and
+// z-fight their way into looking sunk in the ground.
+const AIRPORT_GROUND_CLEARANCE = 4;
+
+// How high above the terrain surface (or the flat ground plane, when terrain
+// is disabled) the camera must stay. Prevents clipping through mountains and
+// diving below the map; also keeps the near plane clear of steep slopes.
+const MIN_CAMERA_CLEARANCE = 400;
+
+// The procedural aircraft model is built ~390 m long at "airliner" scale, so
+// a plane would dwarf the 50 m runways. Scale the body by this factor so the
+// aircraft sits on the field like a real airliner (~40 m). Tags, prediction
+// arrows and trails live on the unscaled outer group and stay readable.
+const PLANE_SCALE = 0.1;
+
+// The whole airport site renders ~2x bigger so each field reads as a proper
+// airport now that the aircraft are ~40 m: pad, apron, terminal and beacon are
+// scaled by this factor (runway length is real terrain, only its width and slab
+// thickness grow). Keep in sync with backend terrain.terrace_radii — the flat
+// terrace must stay bigger than radius * 1.2 * scale.
+const AIRPORT_SITE_SCALE = 2;
 
 // Sim (x, y, z_alt) → Three (x, z_alt, y)
 function toThree(pos: [number, number, number]): THREE.Vector3 {
@@ -103,6 +123,7 @@ function buildAirplane(color: number): {
 } {
   const mat = new THREE.MeshPhongMaterial({ color, shininess: 40 });
   const group = new THREE.Group();
+  group.scale.setScalar(PLANE_SCALE);
   const fuse = new THREE.Mesh(FUSE_GEO, mat);
   fuse.position.z = -15;
   group.add(fuse);
@@ -150,7 +171,7 @@ function makeGroundTexture(day: boolean): THREE.CanvasTexture {
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d")!;
 
-  ctx.fillStyle = day ? "#4a8c3f" : "#0e1f14";
+  ctx.fillStyle = day ? "#c8b178" : "#1a3326";
   ctx.fillRect(0, 0, size, size);
 
   const patchCount = day ? 60 : 50;
@@ -161,8 +182,7 @@ function makeGroundTexture(day: boolean): THREE.CanvasTexture {
     const h = 20 + Math.random() * 70;
     ctx.globalAlpha = 0.15 + Math.random() * 0.25;
     if (day) {
-      const g = 110 + Math.floor(Math.random() * 50);
-      ctx.fillStyle = `rgb(${40 + Math.floor(Math.random() * 30)},${g},${30 + Math.floor(Math.random() * 20)})`;
+      ctx.fillStyle = `rgb(${185 + Math.floor(Math.random() * 35)},${165 + Math.floor(Math.random() * 30)},${95 + Math.floor(Math.random() * 35)})`;
     } else {
       ctx.fillStyle = `rgb(${10 + Math.floor(Math.random() * 18)},${22 + Math.floor(Math.random() * 22)},${8 + Math.floor(Math.random() * 14)})`;
     }
@@ -294,6 +314,7 @@ class AircraftVisual {
     const procedural = buildAirplane(originColor);
     if (sharedGlb) {
       this.airplane = sharedGlb.clone(true);
+      this.airplane.scale.setScalar(PLANE_SCALE);
       this.usesGlb = true;
       // Clones share material instances; give each plane its own so the
       // per-aircraft phase tint doesn't recolor every other plane.
@@ -317,7 +338,7 @@ class AircraftVisual {
       new THREE.SpriteMaterial({ map: this.labelMap, transparent: true, depthTest: false }),
     );
     this.label.scale.set(520, 345, 1);
-    this.label.position.set(0, 320, 0);
+    this.label.position.set(0, PLANE_SCALE * 320, 0);
     this.label.visible = false;
     this.group.add(this.label);
 
@@ -516,7 +537,6 @@ export class SkyScene {
   private framedToContent = false;
 
   boundsGroup: THREE.Group;
-  skyMesh: THREE.Mesh | null = null;
   skyStarField: THREE.Points | null = null;
   skySun: THREE.Sprite | null = null;
   groundMesh: THREE.Mesh | null = null;
@@ -542,15 +562,14 @@ export class SkyScene {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setSize(w, h);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor(NIGHT_CLEAR);
+    this.renderer.setClearColor(NIGHT_FOG_COLOR);
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(NIGHT_CLEAR, NIGHT_FOG_DENSITY);
 
-    this.camera = new THREE.PerspectiveCamera(55, w / h, 50, 120000);
+    this.camera = new THREE.PerspectiveCamera(55, w / h, 50, 600000);
     this.camera.position.set(6000, 9000, 18000);
     this.camera.lookAt(7500, 1500, 7500);
 
@@ -676,7 +695,7 @@ export class SkyScene {
     if (air) {
       const cx = air.width / 2;
       const cz = air.depth / 2;
-      this.camera.position.set(cx + 40000, 28000, cz + 86000);
+      this.camera.position.set(cx, 19000, cz + 32000);
       this.controls.target.set(cx, 600, cz);
     } else {
       this.camera.position.set(6000, 9000, 18000);
@@ -687,22 +706,20 @@ export class SkyScene {
 
   private rebuildEnvironment() {
     const day = this.viewOptions.dayMode;
-    const clearColor = day ? DAY_CLEAR : NIGHT_CLEAR;
+    const clearColor = day ? DAY_FOG_COLOR : NIGHT_FOG_COLOR;
 
     this.renderer.setClearColor(clearColor);
-    (this.scene.fog as THREE.FogExp2).color.setHex(clearColor);
-    (this.scene.fog as THREE.FogExp2).density = day ? DAY_FOG_DENSITY : NIGHT_FOG_DENSITY;
 
-    // Scene lighting: daytime sun keeps the full day values; at night the sun
-    // falls behind a dim blue moon and the fills fade so the world goes dark
-    // and the glowing beacons / tags carry the scene.
-    this.sunLight.intensity = day ? 0.85 : 0.16;
-    this.sunLight.color.setHex(day ? 0xfff8e8 : 0x9fb4dd);
-    this.ambient.intensity = day ? 0.35 : 0.10;
-    this.ambient.color.setHex(day ? 0xffffff : 0x2a3550);
-    this.hemi.intensity = day ? 0.3 : 0.12;
-    this.hemi.color.setHex(day ? 0x8888ff : 0x223355);
-    this.hemi.groundColor.setHex(day ? 0x443322 : 0x0a0c12);
+// Scene lighting: daytime sun keeps the full day values; at night a bright
+    // blue moon keeps the terrain/ground clearly visible, while the glowing
+    // beacons and aircraft tags still read as the focal points.
+    this.sunLight.intensity = day ? 0.85 : 0.8;
+    this.sunLight.color.setHex(day ? 0xfff8e8 : 0xaec2e2);
+    this.ambient.intensity = day ? 0.35 : 0.45;
+    this.ambient.color.setHex(day ? 0xffffff : 0x39466e);
+    this.hemi.intensity = day ? 0.3 : 0.55;
+    this.hemi.color.setHex(day ? 0x8888ff : 0x31405e);
+    this.hemi.groundColor.setHex(day ? 0x443322 : 0x141a24);
 
     this.rebuildBounds();
     this.rebuildSky();
@@ -712,12 +729,6 @@ export class SkyScene {
   }
 
   private rebuildSky() {
-    if (this.skyMesh) {
-      this.scene.remove(this.skyMesh);
-      (this.skyMesh.material as THREE.ShaderMaterial).dispose();
-      this.skyMesh.geometry.dispose();
-      this.skyMesh = null;
-    }
     if (this.skyStarField) {
       this.scene.remove(this.skyStarField);
       this.skyStarField.geometry.dispose();
@@ -731,48 +742,12 @@ export class SkyScene {
     }
 
     const day = this.viewOptions.dayMode;
-    const colors = day ? DAY_SKY : NIGHT_SKY;
 
     const air = this.lastSnapshot?.airspace ?? { width: 15000, depth: 15000, ceiling: 5000 };
     const w = air.width;
     const d = air.depth;
     const ceiling = air.ceiling;
     const radius = 55000;
-
-    const geo = new THREE.SphereGeometry(radius, 28, 18);
-    const mat = new THREE.ShaderMaterial({
-      side: THREE.BackSide,
-      depthWrite: false,
-      fog: false,
-      uniforms: {
-        topColor: { value: new THREE.Color(colors.top) },
-        midColor: { value: new THREE.Color(colors.mid) },
-        bottomColor: { value: new THREE.Color(colors.bottom) },
-      },
-      vertexShader: `
-        varying vec3 vWorldPos;
-        void main() {
-          vec4 wp = modelMatrix * vec4(position, 1.0);
-          vWorldPos = wp.xyz;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform vec3 topColor, midColor, bottomColor;
-        varying vec3 vWorldPos;
-        void main() {
-          float h = normalize(vWorldPos).y;
-          vec3 c = h > 0.0
-            ? mix(midColor, topColor, clamp(h, 0.0, 1.0))
-            : mix(midColor, bottomColor, clamp(-h, 0.0, 1.0));
-          gl_FragColor = vec4(c, 1.0);
-        }
-      `,
-    });
-    const sky = new THREE.Mesh(geo, mat);
-    sky.position.set(w / 2, ceiling / 2, d / 2);
-    this.scene.add(sky);
-    this.skyMesh = sky;
 
     if (!day) {
       const verts: number[] = [];
@@ -781,17 +756,18 @@ export class SkyScene {
         const phi = Math.acos(Math.random() * 0.85 + 0.15);
         const r = radius * 0.95;
         verts.push(
-          r * Math.sin(phi) * Math.cos(theta) + w / 2,
-          r * Math.cos(phi) + ceiling / 2,
-          r * Math.sin(phi) * Math.sin(theta) + d / 2,
+          r * Math.sin(phi) * Math.cos(theta),
+          r * Math.cos(phi),
+          r * Math.sin(phi) * Math.sin(theta),
         );
       }
       const starGeo = new THREE.BufferGeometry();
       starGeo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
-      const stars = new THREE.Points(
-        starGeo,
-        new THREE.PointsMaterial({ color: 0xaabbee, size: 45, sizeAttenuation: true, fog: false }),
-      );
+      const starMat = new THREE.PointsMaterial({ color: 0xaabbee, size: 45, sizeAttenuation: true, fog: false });
+      starMat.depthWrite = false;
+      const stars = new THREE.Points(starGeo, starMat);
+      stars.position.copy(this.camera.position);
+      stars.renderOrder = -1;
       this.scene.add(stars);
       this.skyStarField = stars;
     }
@@ -830,7 +806,7 @@ export class SkyScene {
     const geo = new THREE.PlaneGeometry(size, size);
     geo.rotateX(-Math.PI / 2);
     const tex = makeGroundTexture(day);
-    const tileMetres = 900;
+    const tileMetres = 2400;
     tex.repeat.set(size / tileMetres, size / tileMetres);
     const mat = new THREE.MeshLambertMaterial({
       map: tex,
@@ -843,9 +819,33 @@ export class SkyScene {
     this.groundMesh = mesh;
   }
 
+  /**
+   * Keep the camera above the terrain surface everywhere on the map: never
+   * inside a mountain and never under the ground plane. When the elevation
+   * grid is missing, heightAt returns 0, so the floor becomes the flat
+   * ground plane itself (airspace.flooor - GROUND_CLEARANCE). After lifting
+   * the camera we re-run controls.update() so OrbitControls' internal
+   * spherical state matches the new position instead of fighting it.
+   */
+  private clampCameraToTerrain() {
+    const cam = this.camera.position;
+    const floor = this.lastSnapshot?.airspace.floor ?? 100;
+    const baseY = floor - GROUND_CLEARANCE;
+    const surfaceY = baseY + this.heightAt(cam.x, cam.z);
+    const minY = surfaceY + MIN_CAMERA_CLEARANCE;
+    if (cam.y < minY) {
+      cam.y = minY;
+      this.controls.update();
+    }
+  }
+
   private animate = () => {
     requestAnimationFrame(this.animate);
     this.controls.update();
+    this.clampCameraToTerrain();
+    // Skybox: keep the stars centred on the viewer so zooming out
+    // or panning across the 160 km world can never walk out of them.
+    if (this.skyStarField) this.skyStarField.position.copy(this.camera.position);
     // Keep the shadow-casting sun pinned to the viewer so shadows are crisp
     // wherever the camera is instead of spanning the whole sim.
     const sunDir = this.viewOptions.dayMode
@@ -891,7 +891,7 @@ export class SkyScene {
     this.framedToContent = true;
     const cx = width / 2;
     const cz = depth / 2;
-    this.camera.position.set(cx + 40000, 28000, cz + 86000);
+    this.camera.position.set(cx, 19000, cz + 32000);
     this.controls.target.set(cx, 600, cz);
     this.controls.update();
   }
@@ -902,7 +902,7 @@ export class SkyScene {
     const day = this.viewOptions.dayMode;
     const gridColor1 = day ? 0x88aaaa : 0x222244;
     const gridColor2 = day ? 0x667777 : 0x111133;
-    const grid = new THREE.GridHelper(GROUND_HALF_EXTENT * 2, 640, gridColor1, gridColor2);
+    const grid = new THREE.GridHelper(Math.max(width, depth), 640, gridColor1, gridColor2);
     grid.position.set(width / 2, floor, depth / 2);
     const gridMat = grid.material as THREE.LineBasicMaterial;
     gridMat.transparent = true;
@@ -926,7 +926,7 @@ export class SkyScene {
   }
 
   private updateSkyIfNeeded() {
-    if (!this.skyMesh) {
+    if (!this.skySun) {
       this.rebuildSky();
     }
   }
@@ -940,14 +940,16 @@ export class SkyScene {
   // ────── airports ──────
 
   /**
-   * Surface an airport sits on: the backend-flattened field elevation,
-   * never sinking below the airport's own altitude (center[2]) no matter the
-   * flatten tolerance or grid timing.
+   * Surface an airport sits on: the backend-flattened field elevation, raised
+   * clear of the terrain (AIRPORT_GROUND_CLEARANCE) so the pad and terminal
+   * bed read as placed on the field instead of coplanar/sunk into it. Never
+   * sinks below the airport's own altitude (center[2]) no matter the flatten
+   * tolerance or grid timing.
    */
   private airportGroundY(apt: Airport): number {
     const air = this.lastSnapshot!.airspace;
     const baseY = air.floor - GROUND_CLEARANCE;
-    return baseY + Math.max(this.heightAt(apt.center[0], apt.center[1]), apt.center[2]);
+    return baseY + Math.max(this.heightAt(apt.center[0], apt.center[1]), apt.center[2]) + AIRPORT_GROUND_CLEARANCE;
   }
 
   /** Keep every airport group on the terrain surface. Early-outs when flush. */
@@ -991,10 +993,14 @@ export class SkyScene {
     const themes: ThemedMat[] = [];
     const px = apt.center[0];
     const pz = apt.center[1];
+    const S = AIRPORT_SITE_SCALE;
 
     const padMat = new THREE.MeshPhongMaterial({ opacity: 0.85, transparent: true });
-    const pad = new THREE.Mesh(new THREE.CylinderGeometry(apt.radius * 0.62, apt.radius * 0.62, 26, 28), padMat);
-    pad.position.set(px, groundY + 13, pz);
+    const pad = new THREE.Mesh(
+      new THREE.CylinderGeometry(apt.radius * 0.62 * S, apt.radius * 0.62 * S, 26 * S, 28),
+      padMat,
+    );
+    pad.position.set(px, groundY + 13 * S, pz);
     pad.receiveShadow = true;
     pad.castShadow = true;
     group.add(pad);
@@ -1003,7 +1009,7 @@ export class SkyScene {
     if (apt.hub) {
       const hubMat = new THREE.MeshPhongMaterial({ opacity: 0.5, transparent: true });
       const apron = new THREE.Mesh(
-        new THREE.RingGeometry(apt.radius * 1.05, apt.radius * 1.2, 48),
+        new THREE.RingGeometry(apt.radius * 1.05 * S, apt.radius * 1.2 * S, 48),
         hubMat,
       );
       apron.rotation.x = -Math.PI / 2;
@@ -1022,32 +1028,32 @@ export class SkyScene {
       const rotY = r.heading - Math.PI / 2;
 
       const stripMat = new THREE.MeshPhongMaterial({ opacity: 0.92, transparent: true });
-      const strip = new THREE.Mesh(new THREE.BoxGeometry(r.length, 8, 50), stripMat);
-      strip.position.set(cx, groundY + 7, cz);
+      const strip = new THREE.Mesh(new THREE.BoxGeometry(r.length, 8 * S, 50 * S), stripMat);
+      strip.position.set(cx, groundY + 7 * S, cz);
       strip.rotation.y = rotY;
       strip.receiveShadow = true;
       group.add(strip);
       themes.push({ mat: stripMat, day: 0x3a3d42, night: 0x14161a, closed: 0x4a2f2c });
 
       const lineMat = new THREE.MeshPhongMaterial({ opacity: 0.95, transparent: true });
-      const line = new THREE.Mesh(new THREE.BoxGeometry(r.length, 10, 6), lineMat);
-      line.position.set(cx, groundY + 9, cz);
+      const line = new THREE.Mesh(new THREE.BoxGeometry(r.length, 10 * S, 6 * S), lineMat);
+      line.position.set(cx, groundY + 9 * S, cz);
       line.rotation.y = rotY;
       group.add(line);
       themes.push({ mat: lineMat, day: 0xe8e8e8, night: 0x99a4b3, closed: 0xbb7777 });
     }
 
     const termMat = new THREE.MeshPhongMaterial();
-    const term = new THREE.Mesh(new THREE.BoxGeometry(140, 60, 80), termMat);
-    term.position.set(px + apt.radius * 0.62 * 0.55, groundY + 30, pz);
+    const term = new THREE.Mesh(new THREE.BoxGeometry(140 * S, 60 * S, 80 * S), termMat);
+    term.position.set(px + apt.radius * 0.62 * S * 0.55, groundY + 30 * S, pz);
     term.castShadow = true;
     term.receiveShadow = true;
     group.add(term);
     themes.push({ mat: termMat, day: 0x9aa0a6, night: 0x22262c, closed: 0x74423b });
 
     const roofMat = new THREE.MeshPhongMaterial();
-    const roof = new THREE.Mesh(new THREE.BoxGeometry(150, 12, 92), roofMat);
-    roof.position.set(px + apt.radius * 0.62 * 0.55, groundY + 62, pz);
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(150 * S, 12 * S, 92 * S), roofMat);
+    roof.position.set(px + apt.radius * 0.62 * S * 0.55, groundY + 62 * S, pz);
     roof.castShadow = true;
     group.add(roof);
     themes.push({ mat: roofMat, day: 0x61666b, night: 0x14171c, closed: 0x552e28 });
@@ -1063,9 +1069,9 @@ export class SkyScene {
       transparent: true,
       side: THREE.DoubleSide,
     });
-    const ring = new THREE.Mesh(new THREE.RingGeometry(apt.radius * 0.74, apt.radius * 0.82, 40), ringMat);
+    const ring = new THREE.Mesh(new THREE.RingGeometry(apt.radius * 0.74 * S, apt.radius * 0.82 * S, 40), ringMat);
     ring.rotation.x = -Math.PI / 2;
-    ring.position.set(px, groundY + 36, pz);
+    ring.position.set(px, groundY + 26 * S, pz);
     group.add(ring);
     themes.push({ mat: ringMat, day: beaconColor, night: beaconColor, closed: 0x3a3a3a });
 
@@ -1074,8 +1080,8 @@ export class SkyScene {
       emissive: beaconColor,
       emissiveIntensity: 0.8,
     });
-    const beacon = new THREE.Mesh(new THREE.ConeGeometry(16, 40, 8), beaconMat);
-    beacon.position.set(px + apt.radius * 0.62 * 0.55, groundY + 92, pz);
+    const beacon = new THREE.Mesh(new THREE.ConeGeometry(16 * S, 40 * S, 8), beaconMat);
+    beacon.position.set(px + apt.radius * 0.62 * S * 0.55, groundY + 92 * S, pz);
     group.add(beacon);
     themes.push({ mat: beaconMat, day: 0xffffff, night: 0xffffff, closed: 0x666666 });
 
@@ -1083,8 +1089,8 @@ export class SkyScene {
       apt.closed ? "CLOSED" : apt.hub ? `${apt.name} · HUB` : apt.name,
       0xffffff,
     );
-    label.position.set(px, groundY + 110, pz);
-    label.scale.set(430, 180, 1);
+    label.position.set(px, groundY + 110 * S, pz);
+    label.scale.set(430 * S, 180 * S, 1);
     group.add(label);
     themes.push({ mat: label.material, day: 0x143014, night: 0xddf5dd, closed: 0xff4433 });
 
@@ -1184,8 +1190,8 @@ export class SkyScene {
     const mapU = (u: number) => Math.tanh((u - 0.5) * 2 * compression) / tanhC;
     const rockLine = zmin + 0.5 * (zmax - zmin);
     const rockSpan = Math.max(1, zmax - rockLine);
-    const low = { r: 0.30, g: 0.58, b: 0.22 };
-    const high = { r: 0.62, g: 0.58, b: 0.55 };
+    const low = { r: 0.88, g: 0.78, b: 0.58 };
+    const high = { r: 0.94, g: 0.97, b: 1.0 };
 
     for (let r = 0; r < cols; r++) {
       for (let c = 0; c < cols; c++) {
@@ -1199,8 +1205,8 @@ export class SkyScene {
         positions[i * 3 + 1] = baseY + hgt;
         positions[i * 3 + 2] = sy;
 
-        // Vertex tint: green lowlands rise through tawny foothills to pale
-        // rocky crests; a faint puckering keeps broad faces from looking flat.
+        // Vertex tint: sandy lowlands rise to icy snowy crests; a faint
+        // puckering keeps broad faces from looking flat.
         const crest = clamp01((hgt - rockLine) / rockSpan);
         const vib = 0.05 * Math.sin(sx * 0.0017 + sy * 0.0009 + hgt * 0.002);
         colors[i * 3 + 0] = low.r + (high.r - low.r) * crest + vib;
@@ -1253,7 +1259,7 @@ export class SkyScene {
     };
 
     // trees in small clusters, snapped onto the terrain surface
-    const treeMat = themed(new THREE.MeshLambertMaterial(), 0x2f6b2f, 0x0e2416);
+    const treeMat = themed(new THREE.MeshLambertMaterial(), 0x8a7a4a, 0x0e2416);
     const trunkMat = themed(new THREE.MeshLambertMaterial(), 0x6b5233, 0x241a0e);
     const treeGeo = new THREE.ConeGeometry(1, 1, 5);
     const trunkGeo = new THREE.CylinderGeometry(1, 1, 1, 5);
@@ -1293,7 +1299,7 @@ export class SkyScene {
     }
 
     // far hills — sparse relief toward the horizon, outside the heightfield
-    const farMat = themed(new THREE.MeshLambertMaterial(), 0x38702f, 0x0c1e12);
+    const farMat = themed(new THREE.MeshLambertMaterial(), 0xc9d5e8, 0x0c1e12);
     for (let i = 0; i < 40; i++) {
       const ringR = 34000 + rnd() * 44000;
       const a = rnd() * Math.PI * 2;
@@ -1313,7 +1319,7 @@ export class SkyScene {
 
   private applyTerrainTheme(day: boolean) {
     if (this.terrainMat) {
-      this.terrainMat.color.setHex(day ? 0x4a8c3f : 0x0e1f14);
+      this.terrainMat.color.setHex(day ? 0xffffff : 0x9fb0c4);
     }
     for (const t of this.terrainThemes) {
       t.mat.color.setHex(day ? t.day : t.night);
