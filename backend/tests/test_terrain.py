@@ -119,18 +119,20 @@ def test_generated_airports_sit_on_raised_plateaus(real_airspace):
     """Airports are terraces at the surrounding terrain height (not valleys)."""
     import statistics
 
+    from backend.simulation.terrain import terrace_radii
+
     for apt in real_airspace.airports:
         # Above the default base floor — "different height than the default."
         assert apt.position[2] > real_airspace.floor + 60.0
         # Runways carry the same elevation as the pad underneath them.
         assert all(abs(r.elevation - apt.position[2]) < 1.0 for r in apt.runways)
-        r = max(apt.radius * 2.4, 2800.0)
-        # Densely sample a ring just beyond the flatten so outliers (a nearby
-        # mountain wedge) can't skew the robust "surrounding" picture.
+        _, r_out = terrace_radii(apt)
+        # Densely sample a ring beyond the graded rim (raw surrounding relief)
+        # so outliers (a nearby mountain wedge) can't skew the robust picture.
         ring = [
             real_airspace.terrain_height(
-                apt.position[0] + math.cos(k * 2 * math.pi / 64) * r * 1.6,
-                apt.position[1] + math.sin(k * 2 * math.pi / 64) * r * 1.6,
+                apt.position[0] + math.cos(k * 2 * math.pi / 64) * r_out * 1.3,
+                apt.position[1] + math.sin(k * 2 * math.pi / 64) * r_out * 1.3,
             )
             for k in range(64)
         ]
@@ -147,6 +149,19 @@ def test_generation_is_deterministic():
     np.testing.assert_array_equal(a.terrain.grid, b.terrain.grid)
     c = Airspace(terrain_seed=4321)
     assert not np.array_equal(a.terrain.grid, c.terrain.grid)
+
+
+def test_random_layout_spaced_and_varied():
+    a = Airspace(terrain_seed=1337)
+    b = Airspace(terrain_seed=4321)
+    verts_a = [apt.position[:2] for apt in a.airports]
+    verts_b = [apt.position[:2] for apt in b.airports]
+    # Airports don't stack corner-to-corner: every pair is kept apart.
+    for i, p in enumerate(verts_a):
+        for q in verts_a[i + 1 :]:
+            assert math.hypot(p[0] - q[0], p[1] - q[1]) >= 15000.0
+    # Different seeds scatter to different spots.
+    assert sorted(verts_a) != sorted(verts_b)
 
 
 # ── clearance / detour helpers ────────────────────────────────────────────

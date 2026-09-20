@@ -120,6 +120,7 @@ class Aircraft:
         self.runway: Any = None  # assigned Runway for this leg
         self.dep_runway: Any = None  # runway we depart from this turn
         self.dest_airport: Any = None
+        self.hold_point: tuple[float, float, float] | None = None  # off-runway hold pad for this departure
         self.line_up_cleared = False
         self.join_final = False
         self.go_around = False
@@ -199,6 +200,15 @@ class Aircraft:
             return 0.0
         return self.type_.fly_speed(self.phase)
 
+    def _cleared_for_lineup(self) -> bool:
+        """True once this aircraft is cleared to occupy the runway.
+
+        Aircraft with a dedicated off-runway hold pad must be cleared by the
+        tower before they leave it; legacy/unit-test aircraft (no hold_point)
+        line up as soon as they reach the departure point, exactly as before.
+        """
+        return self.line_up_cleared or self.hold_point is None
+
     def _navigation_target(self) -> tuple[tuple[float, float, float], float, float]:
         """Returns (target_xy, target_alt, phase_speed) for the autopilot."""
         if self.runway is None:
@@ -209,7 +219,10 @@ class Aircraft:
 
         # ---- departure / ground phases use the departure runway ----
         if phase == TAXI_OUT:
-            pt = dep.departure_point()
+            if self._cleared_for_lineup():
+                pt = dep.departure_point()
+            else:
+                pt = self.hold_point or dep.departure_point()
             return self._nav(pt, dep.elevation, TAXI_SPEED)
         if phase == LINE_UP:
             pt = dep.departure_point()
@@ -379,9 +392,8 @@ class Aircraft:
             return
 
         if self.phase == TAXI_OUT:
-            if physics.h_distance(pos, dep.departure_point()) < 90.0:
+            if self._cleared_for_lineup() and physics.h_distance(pos, dep.departure_point()) < 90.0:
                 self.phase = LINE_UP
-                self.line_up_cleared = False
                 dp = dep.departure_point()
                 self.position = (dp[0], dp[1], dep.elevation)
                 self.heading = dep.heading

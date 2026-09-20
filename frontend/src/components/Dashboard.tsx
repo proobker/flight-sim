@@ -56,6 +56,7 @@ export function Dashboard({
   showTags,
   setShowTags,
   onReset,
+  onCloseAirport,
 }: {
   snapshot: SimSnapshot | null;
   dayMode: boolean;
@@ -65,6 +66,7 @@ export function Dashboard({
   showTags: boolean;
   setShowTags: (v: boolean) => void;
   onReset: () => void;
+  onCloseAirport: (aid: string) => void;
 }) {
   if (!snapshot) {
     return (
@@ -133,9 +135,40 @@ export function Dashboard({
             </span>
           </div>
           {snapshot.airspace.airports.map((a) => (
-            <div key={a.id} style={metricStyle}>
+            <div key={a.id} style={{ ...metricStyle, alignItems: "center", gap: 4 }}>
               <span style={labelStyle}>{"· " + a.id}</span>
-              <span style={valueStyle}>{runwayRow(a)}</span>
+              <span
+                style={{
+                  ...valueStyle,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  flex: 1,
+                  color: a.closed ? "#ff6644" : valueStyle.color,
+                }}
+              >
+                {a.closed ? `CLOSED · ${runwayRow(a)}` : runwayRow(a)}
+              </span>
+              {!a.closed && (
+                <button
+                  title={`Close ${a.id}`}
+                  onClick={() => onCloseAirport(a.id)}
+                  style={{
+                    background: "#2a1410",
+                    color: "#cc6655",
+                    border: "1px solid #5a2a1a",
+                    borderRadius: 3,
+                    cursor: "pointer",
+                    fontFamily: "'Consolas', monospace",
+                    fontSize: 10,
+                    lineHeight: 1,
+                    padding: "2px 5px",
+                    flexShrink: 0,
+                  }}
+                >
+                  ✕
+                </button>
+              )}
             </div>
           ))}
         </div>

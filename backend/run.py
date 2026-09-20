@@ -16,7 +16,7 @@ import time
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SkyMesh simulation")
     p.add_argument("--serve", action="store_true", help="run FastAPI server with background sim")
-    p.add_argument("--aircraft", type=int, default=50, help="number of aircraft")
+    p.add_argument("--aircraft", type=int, default=120, help="number of aircraft")
     p.add_argument("--tick-rate", type=float, default=20.0, help="simulation ticks/sec")
     p.add_argument("--sim-speed", type=float, default=2.0, help="time multiplier")
     p.add_argument("--seconds", type=float, default=10.0, help="headless run duration")
