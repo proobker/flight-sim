@@ -292,6 +292,7 @@ from backend.simulation.aircraft import (  # noqa: E402
 )
 from backend.simulation.fleet import (  # noqa: E402
     REGIONAL,
+    TAXI_SPEED,
     TYPES,
     WAKE_HEAVY,
     WAKE_LIGHT,
@@ -477,6 +478,65 @@ def test_final_approach_descends_to_glideslope():
     ac.heading = rw.heading
     assert ac._final_alt() < ac.position[2]
     assert ac.steer_velocity()[2] < 0.0
+
+
+def test_rollout_transitions_to_taxi_in():
+    airspace = Airspace()
+    apt = airspace.airports[0]
+    rw = apt.active_runway()
+    ac = Aircraft(
+        "R1",
+        rw.threshold,
+        destination=apt.position,
+        speed=0.0,
+        cruise_altitude=1500.0,
+        fleet=TYPES[REGIONAL],
+    )
+    ac.runway = rw
+    ac.dep_runway = rw
+    ac.phase = ROLLOUT
+    ac.speed = TAXI_SPEED * 2.0
+    for _ in range(20):
+        ac.advance(1.0)
+        if ac.phase == TAXI_IN:
+            break
+    assert ac.phase == TAXI_IN
+    assert ac.speed > 0.0
+
+
+def test_full_landing_over_terrain_reaches_parked():
+    """With terrain enabled a final-approach aircraft still lands and parks.
+
+    Guards the terrain-clearance floor in `_nav` from stalling the descent
+    (final/flare are exempt) and the formerly-missing rollout → taxi-in link.
+    """
+    airspace = Airspace(terrain_seed=1337)
+    apt = airspace.airports[1]
+    rw = apt.active_runway()
+    t = TYPES[REGIONAL]
+    ux, uy = rw.u
+    thr = rw.threshold
+    px = thr[0] - ux * 8000.0
+    py = thr[1] - uy * 8000.0
+    ac = Aircraft(
+        "T1",
+        (px, py, rw.elevation + 500.0),
+        destination=apt.position,
+        speed=t.approach_speed,
+        cruise_altitude=1800.0,
+        fleet=t,
+    )
+    ac.terrain = airspace.terrain
+    ac.runway = rw
+    ac.dest_airport = apt
+    ac.phase = FINAL
+    ac.heading = rw.heading
+    for _ in range(4000):
+        if ac.phase == PARKED:
+            break
+        ac.advance(1.0)
+    assert ac.phase == PARKED
+    assert ac.position[2] == pytest.approx(apt.position[2], abs=100.0)
 
 
 def test_active_runway_favours_headwind():

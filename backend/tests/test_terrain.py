@@ -115,6 +115,32 @@ def test_generated_airports_are_flattened(real_airspace):
         assert abs(h - apt.position[2]) < 60.0
 
 
+def test_generated_airports_sit_on_raised_plateaus(real_airspace):
+    """Airports are terraces at the surrounding terrain height (not valleys)."""
+    import statistics
+
+    for apt in real_airspace.airports:
+        # Above the default base floor — "different height than the default."
+        assert apt.position[2] > real_airspace.floor + 60.0
+        # Runways carry the same elevation as the pad underneath them.
+        assert all(abs(r.elevation - apt.position[2]) < 1.0 for r in apt.runways)
+        r = max(apt.radius * 2.4, 2800.0)
+        # Densely sample a ring just beyond the flatten so outliers (a nearby
+        # mountain wedge) can't skew the robust "surrounding" picture.
+        ring = [
+            real_airspace.terrain_height(
+                apt.position[0] + math.cos(k * 2 * math.pi / 64) * r * 1.6,
+                apt.position[1] + math.sin(k * 2 * math.pi / 64) * r * 1.6,
+            )
+            for k in range(64)
+        ]
+        med = statistics.median(ring)
+        # Not sunk into a basin: the plateau sits at or modestly above the
+        # local relief (a ~100 m escarpment lip), never far below it.
+        assert apt.position[2] >= med - 250.0, f"{apt.aid} depressed below surroundings"
+        assert apt.position[2] <= med + 550.0, f"{apt.aid} floats absurdly high"
+
+
 def test_generation_is_deterministic():
     a = Airspace(terrain_seed=1234)
     b = Airspace(terrain_seed=1234)

@@ -161,24 +161,53 @@ class TerrainGrid:
         h = np.clip(h, _ZMIN, _ZMAX)
         h = h.astype(np.float32)
 
-        # 4) Flatten the airports (and their runway corridors) to field level.
+        # 4) Raise each airport onto a flat terrace at the *surrounding*
+        # terrain height, so fields sit clearly above the default base floor
+        # instead of being sunk into a valley. A small lip makes the plateau
+        # read as a distinct promontory. Airport and runway elevations are
+        # patched to the plateau so the physics, terminal patterns and the
+        # visual airport all agree with the ground beneath them.
+        LIP = 100.0
         for apt in airspace.airports:
-            ax, ay, az = apt.position
+            ax, ay, _ = apt.position
             R = max(apt.radius * 2.4, 2800.0)
             d = np.hypot(xs - ax, ys - ay)
             w = _smooth(np.clip(d / R, 0.0, 1.0))
-            h = h * w + np.float32(az) * (1.0 - w)
+
+            # Sample the un-flattened relief in an annulus just beyond the
+            # flatten radius — that is the "surrounding's height". The window
+            # must be doubly bounded: a one-sided ramp `> 0.5` would sweep in
+            # the *entire* airspace past 1.5 R, collapsing every plateau onto
+            # the global mean.
+            surrounding = h[(d >= R * 1.5) & (d <= R * 1.75)]
+            plateau = (
+                float(np.mean(surrounding)) + LIP
+                if surrounding.size
+                else float(h.max())
+            )
+            elev = np.float32(plateau)
+
+            # Patch the airport platform + runway elevations so every layer
+            # (physics, tower, plane spawns/landings, frontend) shares the
+            # plateau height.
+            apt.position = (ax, ay, float(elev))
+            h = h * w + elev * (1.0 - w)
             for r in apt.runways or []:
+                r.elevation = float(elev)
+                tx, ty, _ = r.threshold
+                r.threshold = (tx, ty, float(elev))
+
                 u = r.u
                 p0x = r.threshold[0] - u[0] * 10000.0
                 p0y = r.threshold[1] - u[1] * 10000.0
                 p1x = r.threshold[0] + u[0] * 2000.0
                 p1y = r.threshold[1] + u[1] * 2000.0
-            dseg = _segment_distances(
-                pts, [(p0x, p0y), (p1x, p1y)]
-            ).reshape(xs.shape)
-            wseg = _smooth(np.clip(dseg / 1500.0, 0.0, 1.0))
-            h = h * wseg + np.float32(r.elevation) * (1.0 - wseg)
+
+                dseg = _segment_distances(
+                    pts, [(p0x, p0y), (p1x, p1y)]
+                ).reshape(xs.shape)
+                wseg = _smooth(np.clip(dseg / 1500.0, 0.0, 1.0))
+                h = h * wseg + elev * (1.0 - wseg)
 
         # The airport flattening above mixes float64 weights back in; re-cast
         # so the exported grid is exactly float32 (see to_bytes).

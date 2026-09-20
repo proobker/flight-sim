@@ -259,9 +259,20 @@ class Aircraft:
         return self._nav(self.destination, elev, TAXI_SPEED)
 
     def _nav(self, target: tuple[float, float, float], tz: float, phase_speed: float) -> tuple[tuple[float, float, float], float, float]:
-        """Wrap a navigation target with the terrain-clearance safety floor."""
+        """Wrap a navigation target with the terrain-clearance safety floor.
+
+        Final approach and flare are exempt: their commanded altitudes sit at
+        the electronically-flattened runway corridor, so a blanket
+        `terrain + TERRAIN_MIN_CLEARANCE` floor would stall every landing
+        ~250 m above the field. Every other phase keeps the floor.
+        """
         if self.terrain is not None and not self.is_grounded():
-            tz = max(tz, self.terrain_height_at(target[0], target[1]), self.terrain_height_at(self.position[0], self.position[1])) + TERRAIN_MIN_CLEARANCE
+            if self.phase not in (FINAL, FLARE):
+                tz = max(
+                    tz,
+                    self.terrain_height_at(target[0], target[1]),
+                    self.terrain_height_at(self.position[0], self.position[1]),
+                ) + TERRAIN_MIN_CLEARANCE
         return target, tz, phase_speed
 
     def terrain_height_at(self, x: float, y: float) -> float:
@@ -345,12 +356,27 @@ class Aircraft:
 
     # ----- phase transitions (pure geometry; agent grants external gates) -----
     def _autopilot(self, dt: float) -> None:
-        if self.runway is None or self.phase in (PARKED, ROLLOUT):
-            # PARKED / ROLLOUT are terminal phases: no transitional logic.
+        if self.runway is None or self.phase == PARKED:
+            # PARKED is a terminal phase: the agent re-launches it after the
+            # turnaround hold.
             return
 
         dep = self.dep_runway or self.runway
         pos = self.position
+
+        if self.phase == ROLLOUT:
+            # Roll the touchdown speed off along the runway, then turn in and
+            # taxi to the apron (taxi-in → parked closes the leg).
+            ux, uy = self.runway.u
+            end = (
+                self.runway.threshold[0] + ux * (self.runway.length * 0.55),
+                self.runway.threshold[1] + uy * (self.runway.length * 0.55),
+                self.runway.elevation,
+            )
+            if physics.h_distance(pos, end) < 90.0 or self.speed <= TAXI_SPEED + 1.0:
+                self.phase = TAXI_IN
+                self.speed = max(self.speed, TAXI_SPEED)
+            return
 
         if self.phase == TAXI_OUT:
             if physics.h_distance(pos, dep.departure_point()) < 90.0:
