@@ -89,6 +89,7 @@ class TerminalController:
         # Re-chain the wake gaps in ETA order; the tower sequences arrivals.
         prev_open = float("-inf")
         prev_wake: str | None = None
+        slot: Slot | None = None
         for s in slots:
             if s.status == ABORTED:
                 continue
@@ -100,7 +101,7 @@ class TerminalController:
                 slot = s
             prev_open = s.open_at
             prev_wake = s.wake
-        return slot.open_at if "slot" in locals() else max(eta, now)
+        return slot.open_at if slot is not None else max(eta, now)
 
     def slot_open(self, aid: str, runway: str, now: float) -> bool:
         for s in self._slots.get(runway, []):
