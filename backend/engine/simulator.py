@@ -43,6 +43,7 @@ class SimConfig:
     latency_ms: float = 0.0
     multicast_group: str = "239.255.42.99"
     multicast_port: int = 42099
+    terrain_seed: int | None = 1337
 
 
 class Simulator:
@@ -54,6 +55,7 @@ class Simulator:
             floor=self.config.airspace_floor,
             ceiling=self.config.airspace_ceiling,
             wind=WIND,
+            terrain_seed=self.config.terrain_seed,
         )
         self.detector = ConflictDetector(airspace=self.airspace)
         self.terminal = TerminalController()
@@ -152,6 +154,7 @@ class Simulator:
         if port is not None:
             agent.hold_timer = self._rng.uniform(0.0, 6.0)
         node.start()
+        ac.terrain = self.airspace.terrain
         self.agents.append(agent)
         self.node_ids[aid] = node
 

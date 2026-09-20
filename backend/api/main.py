@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
+import sys
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from ..engine.simulator import SimConfig, Simulator
@@ -29,8 +32,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def _startup_install_exception_handler():
+    await _install_exception_handler()
+
+
 sim: Simulator | None = None
 _connected: list[WebSocket] = []
+
+
+def _compress(payload: bytes) -> bytes:
+    return gzip.compress(payload, compresslevel=9)
 
 
 def get_sim() -> Simulator:
@@ -39,6 +52,25 @@ def get_sim() -> Simulator:
 
 
 # ────────── lifecycle ──────────
+
+# Windows asyncio quirk: when a TCP/WebSocket client disconnects abruptly the
+# proactor transport's _call_connection_lost() cleanup calls
+# self._sock.shutdown() on an already-closed socket, raising
+# ConnectionResetError/WinError 10054 (or 10038). It's harmless loop noise,
+# so we filter exactly those codes and pass everything else to the default
+# handler.
+def _quiet_windows_proactor_noise(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+    exception = context.get("exception")
+    if sys.platform == "win32" and isinstance(exception, OSError):
+        code = getattr(exception, "winerror", None) or getattr(exception, "errno", None)
+        if code in (10054, 10038):
+            return
+    asyncio.events.default_exception_handler(loop, context)
+
+
+async def _install_exception_handler() -> None:
+    asyncio.get_running_loop().set_exception_handler(_quiet_windows_proactor_noise)
+
 
 async def init_simulator(config: SimConfig | None = None) -> None:
     global sim
@@ -66,6 +98,35 @@ if not HAS_FRONTEND:
 @app.get("/api/state")
 async def get_state():
     return get_sim().snapshot()
+
+
+@app.get("/api/terrain")
+async def terrain_metadata():
+    """Terrain grid metadata (bounds, resolution, elevation range)."""
+    terrain = get_sim().airspace.terrain
+    if terrain is None:
+        return {"enabled": False}
+    return {"enabled": True, **terrain.metadata()}
+
+
+@app.get("/api/terrain/grid")
+async def terrain_grid():
+    """The Float32 elevation grid (gzip'd) — fetched once by the frontend."""
+    terrain = get_sim().airspace.terrain
+    if terrain is None:
+        return Response(content=b"", media_type="application/octet-stream", status_code=404)
+    payload = terrain.to_bytes()
+    compressed = _compress(payload)
+    return Response(
+        content=compressed,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Encoding": "gzip",
+            "Cache-Control": "public, max-age=3600",
+            "X-Terrain-Bytes": str(len(payload)),
+            "X-Terrain-Cells": f"{terrain.width}x{terrain.height}",
+        },
+    )
 
 
 @app.post("/api/control/kill")

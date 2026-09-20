@@ -15,6 +15,7 @@ from typing import Any
 
 from . import physics
 from .fleet import TAXI_SPEED, AircraftType
+from .terrain import TERRAIN_LOOKAHEAD_S, TERRAIN_MIN_CLEARANCE
 
 PRIORITY_EMERGENCY = 4
 PRIORITY_MEDICAL = 3
@@ -75,6 +76,7 @@ class Aircraft:
         approach_radius: float = 4000.0,
         approach_altitude_offset: float = 60.0,
         fleet: AircraftType | None = None,
+        terrain=None,
     ) -> None:
         self.id = aircraft_id
         self.position = position
@@ -94,6 +96,15 @@ class Aircraft:
 
         self.type_: AircraftType = fleet or _default_fleet()
         self.wake = self.type_.wake
+        self.terrain = terrain  # TerrainGrid | None
+
+        # Terrain awareness state (updated by update_terrain_state each tick).
+        self.terrain_wp: tuple[float, float, float] | None = None
+        self.terrain_climb_target: float | None = None
+        self.terrain_detour = False
+        self.terrain_warning = False
+        self.terrain_ahead = 0.0
+        self.agl = 0.0
 
         self.heading = heading
         self.active = True
@@ -199,51 +210,120 @@ class Aircraft:
         # ---- departure / ground phases use the departure runway ----
         if phase == TAXI_OUT:
             pt = dep.departure_point()
-            return (pt, dep.elevation, TAXI_SPEED)
+            return self._nav(pt, dep.elevation, TAXI_SPEED)
         if phase == LINE_UP:
             pt = dep.departure_point()
-            return (pt, dep.elevation, 0.0)
+            return self._nav(pt, dep.elevation, 0.0)
         if phase == TAKEOFF:
             ux, uy = dep.u
             far = (dep.threshold[0] + ux * 12000.0, dep.threshold[1] + uy * 12000.0, dep.elevation)
             if not self.rotated:
-                return (far, dep.elevation, 0.0)
-            return (far, self._takeoff_alt(dep.elevation), 0.0)
+                return self._nav(far, dep.elevation, 0.0)
+            return self._nav(far, self._takeoff_alt(dep.elevation), 0.0)
         if phase == CLIMBOUT:
             ux, uy = dep.u
             far = (dep.threshold[0] + ux * 24000.0, dep.threshold[1] + uy * 24000.0, dep.elevation)
-            return (far, min(self.cruise_altitude, dep.elevation + 520.0), 0.0)
+            return self._nav(far, min(self.cruise_altitude, dep.elevation + 520.0), 0.0)
 
         # ---- arrival / pattern phases use the arrival runway ----
         rw = self.runway
         elev = rw.elevation
         if phase in (CLIMB, CRUISE):
-            return (self.waypoint or self.destination, self.cruise_altitude, 0.0)
+            tgt = self.terrain_wp or self.waypoint or self.destination
+            tz = max(self.cruise_altitude, self.terrain_climb_target or 0.0)
+            return self._nav(tgt, tz, 0.0)
         if phase == GO_AROUND:
             entry = rw.downwind_entry(self.type_)
-            return (entry, rw.pattern_alt(self.type_), 0.0)
+            return self._nav(entry, rw.pattern_alt(self.type_), 0.0)
         if phase == DESCENT:
             entry = rw.downwind_entry(self.type_)
-            return (self.waypoint or entry, rw.pattern_alt(self.type_), 0.0)
+            return self._nav(self.waypoint or entry, rw.pattern_alt(self.type_), 0.0)
         if phase == DOWNWIND:
             abeam = rw.downwind_abeam(self.type_)
             if self.downwind_extension > 0.0:
                 ux, uy = rw.u
                 abeam = (abeam[0] - ux * self.downwind_extension, abeam[1] - uy * self.downwind_extension, abeam[2])
-            return (abeam, rw.pattern_alt(self.type_), 0.0)
+            return self._nav(abeam, rw.pattern_alt(self.type_), 0.0)
         if phase == BASE:
             fix = rw.approach_fix(self.type_.final_len)
-            return (fix, rw.pattern_alt(self.type_), 0.0)
+            return self._nav(fix, rw.pattern_alt(self.type_), 0.0)
         if phase in (FINAL, FLARE):
             thr = (rw.threshold[0], rw.threshold[1], elev)
-            return (thr, self._final_alt(), 0.0)
+            return self._nav(thr, self._final_alt(), 0.0)
         if phase == ROLLOUT:
             ux, uy = rw.u
             end = (rw.threshold[0] + ux * (rw.length * 0.55), rw.threshold[1] + uy * (rw.length * 0.55), elev)
-            return (end, elev, 0.0)
+            return self._nav(end, elev, 0.0)
         if phase == TAXI_IN:
-            return (self.destination, elev, TAXI_SPEED)
-        return (self.destination, elev, TAXI_SPEED)
+            return self._nav(self.destination, elev, TAXI_SPEED)
+        return self._nav(self.destination, elev, TAXI_SPEED)
+
+    def _nav(self, target: tuple[float, float, float], tz: float, phase_speed: float) -> tuple[tuple[float, float, float], float, float]:
+        """Wrap a navigation target with the terrain-clearance safety floor."""
+        if self.terrain is not None and not self.is_grounded():
+            tz = max(tz, self.terrain_height_at(target[0], target[1]), self.terrain_height_at(self.position[0], self.position[1])) + TERRAIN_MIN_CLEARANCE
+        return target, tz, phase_speed
+
+    def terrain_height_at(self, x: float, y: float) -> float:
+        return self.terrain.height_at(x, y) if self.terrain is not None else 0.0
+
+    def update_terrain_state(self) -> None:
+        """TAWS-style look-ahead: raise the floor, warn, climb or route around.
+
+        Drives ``terrain_climb_target`` (overfly when reachable) and
+        ``terrain_detour``/``terrain_wp`` (re-route when a crest is too tall).
+        """
+        self.terrain_ahead = 0.0
+        self.terrain_warning = False
+        if self.terrain is None:
+            self.terrain_wp = None
+            self.terrain_climb_target = None
+            self.terrain_detour = False
+            self.agl = 0.0
+            return
+
+        px, py, pz = self.position
+        self.agl = max(0.0, pz - self.terrain_height_at(px, py))
+
+        if self.phase not in (CLIMB, CRUISE):
+            self._clear_terrain_escape()
+            return
+
+        v = self.current_velocity()
+        speed = math.hypot(v[0], v[1])
+        look = max(2500.0, speed * TERRAIN_LOOKAHEAD_S)
+        if speed > 1.0:
+            hx, hy = v[0] / speed, v[1] / speed
+        else:
+            hx, hy = math.sin(self.heading), math.cos(self.heading)
+        qx, qy = px + hx * look, py + hy * look
+        max_e, frac = self.terrain.max_along((px, py, pz), (qx, qy, pz), step=max(200.0, look / 24.0))
+        self.terrain_ahead = max_e
+
+        required = max_e + TERRAIN_MIN_CLEARANCE
+        if required <= pz - 5.0:
+            # The way ahead is clear at our altitude — drop any terrain escape.
+            self._clear_terrain_escape()
+            return
+
+        self.terrain_warning = True
+        overflyable = required <= self.max_altitude
+        speed_ok = speed > 1e-9
+        t_peak = (frac * look) / speed if speed_ok else float("inf")
+        t_climb = (required - pz) / max(self.type_.climb_rate, 0.5)
+        if overflyable and t_climb <= t_peak + 2.0:
+            # We can out-climb the rising ground before it reaches us.
+            self.terrain_climb_target = max(self.terrain_climb_target or 0.0, required)
+            self.terrain_detour = False
+        else:
+            # Too tall or too close — keep climbing as best effort and route around.
+            self.terrain_climb_target = max(self.terrain_climb_target or 0.0, min(required, self.max_altitude))
+            self.terrain_detour = True
+
+    def _clear_terrain_escape(self) -> None:
+        self.terrain_wp = None
+        self.terrain_climb_target = None
+        self.terrain_detour = False
 
     def _legacy_target(self) -> tuple[tuple[float, float, float], float, float]:
         """Original free-flight autopilot: straight to the destination."""
@@ -495,6 +575,9 @@ class Aircraft:
             ),
             "maneuvering": self.plan is not None and self.plan.duration > 0,
             "landing": self.is_landing(),
+            "agl": round(self.agl, 1),
+            "terrain_warning": self.terrain_warning,
+            "terrain_ahead": round(self.terrain_ahead, 1),
             "distance": self.distance_travelled,
             "fuel": self.fuel_used,
         }

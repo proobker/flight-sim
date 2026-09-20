@@ -34,6 +34,17 @@ export interface WindInfo {
   direction: string;
 }
 
+export interface TerrainMeta {
+  enabled: boolean;
+  x0: number;
+  y0: number;
+  cell: number;
+  width: number;
+  height: number;
+  zmin: number;
+  zmax: number;
+}
+
 export interface AirspaceSnapshot {
   width: number;
   depth: number;
@@ -41,6 +52,7 @@ export interface AirspaceSnapshot {
   ceiling: number;
   airports: Airport[];
   obstacles: Obstacle[];
+  terrain?: TerrainMeta;
 }
 
 export interface NeighborInfo {
@@ -79,6 +91,9 @@ export interface AircraftSnapshot {
   landing: boolean;
   distance: number;
   fuel: number;
+  agl: number;
+  terrain_warning: boolean;
+  terrain_ahead: number;
   neighbors: NeighborInfo[];
   conflict_with: string[];
 }

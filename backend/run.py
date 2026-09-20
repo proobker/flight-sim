@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim-speed", type=float, default=2.0, help="time multiplier")
     p.add_argument("--seconds", type=float, default=10.0, help="headless run duration")
     p.add_argument("--seed", type=int, default=42, help="random seed")
+    p.add_argument("--terrain-seed", type=int, default=1337, help="terrain generation seed (None disables terrain)")
     p.add_argument("--host", default="127.0.0.1", help="server host")
     p.add_argument("--port", type=int, default=8000, help="server port")
     return p.parse_args()
@@ -33,6 +34,7 @@ async def run_headless(args: argparse.Namespace) -> None:
         num_aircraft=args.aircraft,
         tick_rate=args.tick_rate,
         sim_speed=args.sim_speed,
+        terrain_seed=args.terrain_seed,
     )
     sim = Simulator(config)
     sim._rng.seed(args.seed)
@@ -64,6 +66,7 @@ def run_server(args: argparse.Namespace) -> None:
         num_aircraft=args.aircraft,
         tick_rate=args.tick_rate,
         sim_speed=args.sim_speed,
+        terrain_seed=args.terrain_seed,
     )
 
     @app.on_event("startup")

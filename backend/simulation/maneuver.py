@@ -103,6 +103,13 @@ def filter_candidates(
                 reasons.append(f"obstacle-{obs.obs_id}")
                 break
 
+        if ok and airspace is not None:
+            from .terrain import TERRAIN_MIN_CLEARANCE
+
+            if not airspace.terrain_motion_clear(self_pos, cand.plan.velocity, cand.plan.duration, TERRAIN_MIN_CLEARANCE):
+                ok = False
+                reasons.append("terrain")
+
         cand.reasons = reasons
         cand.safe = ok
         if ok:

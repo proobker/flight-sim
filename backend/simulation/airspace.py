@@ -9,6 +9,7 @@ from typing import Any
 
 from .fleet import AircraftType
 from . import physics
+from .terrain import TERRAIN_MIN_CLEARANCE, TerrainGrid
 
 AIRPORT_NAMES = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"]
 
@@ -220,6 +221,8 @@ class Airspace:
         ceiling: float = 6000.0,
         airports: list[Airport] | None = None,
         wind: tuple[float, float, float] | None = None,
+        terrain: TerrainGrid | None = None,
+        terrain_seed: int | None = None,
     ) -> None:
         self.width = width
         self.depth = depth
@@ -230,6 +233,9 @@ class Airspace:
         self.airports: list[Airport] = airports if airports is not None else self._default_airports()
         for a in self.airports:
             self.add_runways_for(a)
+        self.terrain = terrain
+        if self.terrain is None and terrain_seed is not None:
+            self.terrain = TerrainGrid.from_airspace(self, seed=terrain_seed)
         self._next_obs = 0
 
     def _default_airports(self) -> list[Airport]:
@@ -380,8 +386,38 @@ class Airspace:
             return None
         return self.enforce_bounds(best)
 
+    # ----- terrain (elevation model) -----
+
+    def terrain_height(self, x: float, y: float) -> float:
+        """Elevation [m] at a ground point (0 when terrain is disabled)."""
+        if self.terrain is None:
+            return 0.0
+        return self.terrain.height_at(x, y)
+
+    def terrain_detour_waypoint(
+        self,
+        a: tuple[float, float, float],
+        b: tuple[float, float, float],
+        current_alt: float,
+        clearance: float = TERRAIN_MIN_CLEARANCE,
+    ) -> tuple[float, float, float] | None:
+        if self.terrain is None:
+            return None
+        return self.terrain.detour_waypoint(a, b, current_alt, clearance)
+
+    def terrain_motion_clear(
+        self,
+        start: tuple[float, float, float],
+        velocity: tuple[float, float, float],
+        duration: float,
+        clearance: float = TERRAIN_MIN_CLEARANCE,
+    ) -> bool:
+        if self.terrain is None:
+            return True
+        return self.terrain.motion_clearance_ok(start, velocity, duration, clearance)
+
     def snapshot(self) -> dict[str, Any]:
-        return {
+        snap = {
             "width": self.width,
             "depth": self.depth,
             "floor": self.floor,
@@ -389,6 +425,9 @@ class Airspace:
             "airports": [a.snapshot() for a in self.airports],
             "obstacles": [o.snapshot() for o in self.obstacles if o.active],
         }
+        if self.terrain is not None:
+            snap["terrain"] = self.terrain.metadata()
+        return snap
 
 
 def _segment_intersects_cylinder(

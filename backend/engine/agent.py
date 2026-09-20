@@ -26,6 +26,7 @@ from ..simulation.maneuver import generate_candidates, filter_candidates
 from ..simulation.cost import plan_cost
 from ..simulation.negotiation import proposal_consensus_response
 from ..simulation.uncertainty import SilentRegion
+from ..simulation.terrain import TERRAIN_MIN_CLEARANCE
 
 
 class AircraftAgent:
@@ -64,6 +65,7 @@ class AircraftAgent:
         self._final_registered = False
         self._slot_open: float | None = None
         self._dep_noted = False
+        self._terrain_wp_at = 0.0
 
     @property
     def id(self) -> str:
@@ -184,6 +186,9 @@ class AircraftAgent:
         end = physics.advance(start, velocity, self.aircraft.maneuver_duration)
         if not self.airspace.in_bounds(end):
             return False
+        if self.airspace.terrain is not None:
+            if not self.airspace.terrain_motion_clear(start, velocity, self.aircraft.maneuver_duration, TERRAIN_MIN_CLEARANCE):
+                return False
         for entry in self.neighbors.live_neighbors(self.sim_time):
             if self._skip_pair(entry):
                 continue
@@ -355,7 +360,21 @@ class AircraftAgent:
         self.aircraft.advance(dt)
         self._manage_terminal(now, dt)
 
-        # Waypoint obstacle routing only en-route; the pattern owns itself.
+        # Terrain awareness: raise the floor, and climb or route around
+        # rising ground while en route.
+        ac = self.aircraft
+        ac.update_terrain_state()
+        if ac.phase in ("climb", "cruise"):
+            if ac.terrain_detour:
+                if ac.terrain_wp is None or now - self._terrain_wp_at > 1.0:
+                    ac.terrain_wp = self.airspace.terrain_detour_waypoint(
+                        ac.position, ac.destination, ac.position[2], TERRAIN_MIN_CLEARANCE
+                    )
+                    self._terrain_wp_at = now
+            elif ac.terrain_wp is not None:
+                ac.terrain_wp = None
+
+        # Waypoint obstacle routing only en route; the pattern owns itself.
         if self.aircraft.plan is None:
             if self.aircraft.phase in ("climb", "cruise"):
                 self.aircraft.waypoint = self.airspace.waypoint_around(

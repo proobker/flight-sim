@@ -71,7 +71,14 @@ def main() -> None:
         "--port",
         str(args.port),
     ]
-    raise SystemExit(subprocess.run(cmd, cwd=ROOT).returncode)
+    try:
+        code = subprocess.run(cmd, cwd=ROOT).returncode
+    except KeyboardInterrupt:
+        # Ctrl+C reaches both processes; the backend exits on its own. Don't
+        # let the parent's own interrupt surface as a traceback.
+        print("\n[start] stopped.")
+        raise SystemExit(0)
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

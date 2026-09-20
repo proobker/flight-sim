@@ -77,21 +77,9 @@ export function Dashboard({
     );
   }
 
-  const rows: Array<[string, string]> = [
-    ["Aircraft", `${snapshot.active}/${snapshot.network_nodes_total}`],
-    ["Active conflicts", `${snapshot.active_conflicts}`],
-    ["Resolved", `${snapshot.conflicts_resolved}`],
-    ["Detected", `${snapshot.conflicts_detected}`],
-    ["Collisions", `${snapshot.collisions}`],
-    ["Near misses", `${snapshot.near_misses}`],
-    ["Min sep", snapshot.min_separation != null ? `${(snapshot.min_separation / 1000).toFixed(2)} km` : "---"],
-    ["Avg res", `${snapshot.avg_resolution_ms.toFixed(0)} ms`],
-    ["Failed", `${snapshot.nodes_failed}`],
-    ["Partitions", `${snapshot.partition_events}`],
-    ["Sim time", `${snapshot.time.toFixed(1)}s`],
-  ];
-
   const windVec = snapshot.wind?.vector ?? null;
+  const terrain = snapshot.airspace.terrain;
+  const taws = snapshot.aircraft.filter((a) => a.active && a.terrain_warning).length;
   const runwayRating = (r: Runway): number => {
     if (!windVec) return 0;
     return -(windVec[0] * Math.sin(r.heading) + windVec[1] * Math.cos(r.heading));
@@ -108,6 +96,21 @@ export function Dashboard({
       ? `${a.name} R${r.heading_label} · ${inbound(a)} inbound`
       : `${a.name} · ${inbound(a)} inbound`;
   };
+  const rows: Array<[string, string]> = [
+    ["Aircraft", `${snapshot.active}/${snapshot.network_nodes_total}`],
+    ["Active conflicts", `${snapshot.active_conflicts}`],
+    ["Resolved", `${snapshot.conflicts_resolved}`],
+    ["Detected", `${snapshot.conflicts_detected}`],
+    ["Collisions", `${snapshot.collisions}`],
+    ["Near misses", `${snapshot.near_misses}`],
+    ["Min sep", snapshot.min_separation != null ? `${(snapshot.min_separation / 1000).toFixed(2)} km` : "---"],
+    ["Avg res", `${snapshot.avg_resolution_ms.toFixed(0)} ms`],
+    ["Failed", `${snapshot.nodes_failed}`],
+    ["Partitions", `${snapshot.partition_events}`],
+    ["Terrain", terrain ? `${Math.round(terrain.zmin)}–${Math.round(terrain.zmax)} m` : "flat"],
+    ["TAWS warns", `${taws}`],
+    ["Sim time", `${snapshot.time.toFixed(1)}s`],
+  ];
 
   return (
     <div className="panel dashboard">
@@ -135,6 +138,17 @@ export function Dashboard({
               <span style={valueStyle}>{runwayRow(a)}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {terrain && (
+        <div style={{ borderTop: "1px solid #1a3a2a", marginTop: 8, paddingTop: 6 }}>
+          <div style={metricStyle}>
+            <span style={labelStyle}>TERRAIN</span>
+            <span style={valueStyle}>
+              {(terrain.cell * (terrain.width - 1) / 1000).toFixed(0)} km · {terrain.cell} m cells
+            </span>
+          </div>
         </div>
       )}
 
