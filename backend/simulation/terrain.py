@@ -20,6 +20,10 @@ import numpy as np
 
 # Minimum vertical clearance aircraft aim to keep above the terrain (m).
 TERRAIN_MIN_CLEARANCE = 250.0
+# How far above the highest crest along a route a cruise altitude is raised,
+# so en-route traffic flies comfortably over terrain instead of riding the
+# TERRAIN_MIN_CLEARANCE floor along ridge lines.
+CRUISE_TERRAIN_BUFFER = 800.0
 # Look-ahead window while scanning for rising terrain (seconds of flight).
 TERRAIN_LOOKAHEAD_S = 15.0
 # How far past the airspace edge the grid extends (fraction of half extent);

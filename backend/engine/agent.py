@@ -20,7 +20,7 @@ from ..network.neighbor import NeighborTable
 from ..network.udp_node import UdpNode
 from ..simulation import physics
 from ..simulation.aircraft import Aircraft, ARRIVAL_PHASES, GROUND_PHASES
-from ..simulation.airspace import random_cruise_altitude
+from ..simulation.airspace import cruise_altitude_over_route, random_cruise_altitude
 from ..simulation.conflict import Conflict, ConflictDetector
 from ..simulation.maneuver import generate_candidates, filter_candidates
 from ..simulation.cost import plan_cost
@@ -507,7 +507,12 @@ class AircraftAgent:
         ac.destination = next_port.position
         ac.origin_aid = port.aid
         ac.dest_aid = next_port.aid
-        ac.cruise_altitude = random_cruise_altitude()
+        ac.cruise_altitude = cruise_altitude_over_route(
+            random_cruise_altitude(),
+            self.airspace.terrain,
+            ac.hold_point,
+            next_port.position,
+        )
         ac.leg_distance = max(1.0, physics.h_distance(ac.hold_point, next_port.position))
         ac.leg_travelled = 0.0
         ac.plan = None

@@ -242,6 +242,22 @@ def test_no_detour_when_route_is_clear():
 # ── aircraft terrain awareness ────────────────────────────────────────────
 
 
+def test_cruise_altitude_over_route_clears_crests(real_airspace):
+    """Terrain-aware cruise assignment raises en-route altitude above the
+    route's tallest crest, instead of riding the TAWS floor along ridges."""
+    from backend.simulation.airspace import cruise_altitude_over_route
+    from backend.simulation.terrain import CRUISE_TERRAIN_BUFFER
+
+    tg = real_airspace.terrain
+    a, b = real_airspace.airports[0], real_airspace.airports[1]
+    crest, _ = tg.max_along(a.position, b.position, step=200.0)
+    cruise = cruise_altitude_over_route(1800.0, tg, a.position, b.position)
+    assert cruise >= crest + CRUISE_TERRAIN_BUFFER - 1e-9
+    assert cruise <= real_airspace.ceiling
+    # Without terrain the band is kept as-is.
+    assert cruise_altitude_over_route(2500.0, None, a.position, b.position) == 2500.0
+
+
 def test_update_terrain_state_raises_floor():
     tg = crafted_grid(peak=3400.0)
     # Heading straight into the flank of the mountain.

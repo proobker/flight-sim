@@ -15,6 +15,7 @@ import type { SimSnapshot, AircraftSnapshot, Airport, TerrainMeta } from "../api
 import {
   buildStaticTerrainGeometry,
   createUnifiedHeightField,
+  retargetTerrainRingFade,
   type StaticTerrainSpec,
 } from "./terrainField";
 
@@ -70,6 +71,13 @@ const DAY_FOG_COLOR = 0xcceeff;
 // relief simply dissolves over the horizon instead of ending at a visible edge.
 const FOG_NEAR = 35000;
 const FOG_FAR = 340000;
+
+/** 0xRRGGBB → { r, g, b } in [0, 1], matching the relief-colour authoring. */
+const FOG_RGB = (hex: number) => ({
+  r: ((hex >> 16) & 255) / 255,
+  g: ((hex >> 8) & 255) / 255,
+  b: (hex & 255) / 255,
+});
 
 // The ground extends far beyond the camera's max zoom so its edge is never
 // visible — the world reads as endless even at the max zoom-out.
@@ -759,6 +767,7 @@ export class SkyScene {
       this.camera.position.set(6000, 9000, 18000);
       this.controls.target.set(7500, 1500, 7500);
     }
+    this.snapOrbitTargetToTerrain();
     this.controls.update();
   }
 
@@ -913,6 +922,19 @@ export class SkyScene {
     }
   }
 
+  /**
+   * Keep the orbit pivot on (not under) the terrain surface. The default pivot
+   * is a fixed low altitude, but the map centre can be a ~3.5 km peak; a target
+   * buried under it makes every wheel-zoom stall against clampCameraToTerrain.
+   * No-op until the authoritative grid is loaded.
+   */
+  private snapOrbitTargetToTerrain() {
+    if (!this.terrainEnabled()) return;
+    const t = this.controls.target;
+    t.y = this.baseY() + this.heightAt(t.x, t.z) + MIN_CAMERA_CLEARANCE;
+    this.controls.update();
+  }
+
   private animate = () => {
     requestAnimationFrame(this.animate);
     this.controls.update();
@@ -967,6 +989,7 @@ export class SkyScene {
     const cz = depth / 2;
     this.camera.position.set(cx, 19000, cz + 32000);
     this.controls.target.set(cx, 600, cz);
+    this.snapOrbitTargetToTerrain();
     this.controls.update();
   }
 
@@ -1290,7 +1313,14 @@ export class SkyScene {
       ringCell: meta.cell * 8,
       ringReach: TERRAIN_RING_REACH,
     };
-    const geo = await buildStaticTerrainGeometry(meta, this.heightAt, baseY, spec, yieldToMain);
+    const geo = await buildStaticTerrainGeometry(
+      meta,
+      this.heightAt,
+      baseY,
+      spec,
+      yieldToMain,
+      FOG_RGB(this.viewOptions.dayMode ? DAY_FOG_COLOR : NIGHT_FOG_COLOR),
+    );
     const mesh = new THREE.Mesh(geo, this.terrainMat);
     mesh.castShadow = false;
     mesh.receiveShadow = true;
@@ -1363,10 +1393,17 @@ export class SkyScene {
     }
 
     this.applyTerrainTheme(this.viewOptions.dayMode);
+    // Lift the orbit pivot out of any terrain it currently sits below, so
+    // zooming toward the map centre can reach the ground instead of stalling
+    // on the camera clamp above the newly-built surface.
+    this.snapOrbitTargetToTerrain();
     this.terrainReady = true;
   }
 
   private applyTerrainTheme(day: boolean) {
+    if (this.terrainMesh) {
+      retargetTerrainRingFade(this.terrainMesh.geometry, FOG_RGB(day ? DAY_FOG_COLOR : NIGHT_FOG_COLOR));
+    }
     if (this.terrainMat) {
       this.terrainMat.color.setHex(day ? 0xffffff : 0x9fb0c4);
     }

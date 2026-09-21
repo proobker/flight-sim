@@ -2,21 +2,23 @@
  * terrainField — deterministic, everywhere-defined terrain height sampling.
  *
  * The backend serves one authoritative (finite) elevation grid over the
- * airspace. Beyond that grid the land used to fall away to a flat plane. Here
- * we extend it to genuinely infinite relief:
+ * airspace. Beyond that grid the land eases into gentle, calm lowland that
+ * rolls to the horizon. It deliberately does NOT re-run the full relief
+ * recipe: doing so re-created 600-3000 m ridged mountain bands just past the
+ * map rim (the ridged fBm "spines"), which rendered as a regular, artificial
+ * border of parallel ripples around the world.
  *
- *   - `createProceduralHeightField` is a JS port of the backend relief recipe
- *     (coastal value-noise fBm plains, three spinal ridges, a valley carve),
- *     evaluated at arbitrary world coordinates so it is continuous across the
- *     whole plane — no seams, no tiling artefacts, deterministic for a seed.
- *   - `createUnifiedHeightField` blends the two: exact backend bilinear values
- *     inside the grid, an eased crossfade to the procedural field across a
- *     band just outside its rim, and pure procedural relief beyond — so the
- *     world reads as one endless landscape.
+ *   - `createUnifiedHeightField` exposes one height function for the whole
+ *     plane: exact backend bilinear values inside the grid, easing into the
+ *     lowland field across `RING_RAMP` metres outside its rim.
  *   - `buildStaticTerrainGeometry` snapshots that height function into one
  *     world-anchored structured grid (fine over the backend grid, coarsening
  *     beyond it) for display — built once and never re-anchored, so the
- *     rendered ground never changes as the camera moves.
+ *     rendered ground never changes as the camera moves. Its coarse outer
+ *     lattice can optionally fade toward the scene haze colour with distance
+ *     so it dissolves before its facets (or its far edge) can read on screen.
+ *   - `createProceduralHeightField` remains exported for reference / reuse but
+ *     is no longer part of the world: the ring is calm lowland by design.
  */
 
 import * as THREE from "three";
@@ -38,6 +40,11 @@ export interface StaticTerrainSpec {
 
 const ZMIN = 100.0;
 const ZMAX = 4700.0;
+
+/** Distance (metres) over which land outside the backend grid eases into calm
+ * lowland. Long enough that the transition is invisible, short enough that the
+ * lowland is fully established well before the coarse ring's outer edge. */
+export const RING_RAMP = 30000;
 
 function _smooth(t: number): number {
   return t * t * (3.0 - 2.0 * t);
@@ -183,15 +190,16 @@ export function createProceduralHeightField(
 /**
  * One height function for the whole world. Inside the authoritative grid the
  * backend bilinear value is returned exactly (physics/aircraft see the same
- * land). Across `blend` metres outside the rim the value eases toward the
- * procedural field, which then continues forever.
+ * land). Outside its rim the value eases into a calm, deterministic lowland
+ * field across `ramp` metres, so the world past the map recedes to gentle
+ * rolling plains instead of re-raising fake mountain borders.
  */
 export function createUnifiedHeightField(
   meta: TerrainMeta,
   grid: Float32Array,
-  cx: number,
-  cy: number,
-  blend = 20000,
+  _cx: number,
+  _cy: number,
+  ramp = RING_RAMP,
 ): HeightField {
   const { x0, y0, cell, width, height } = meta;
   const x1 = x0 + (width - 1) * cell;
@@ -211,7 +219,12 @@ export function createUnifiedHeightField(
     return a + (b - a) * tx + (c - a) * ty + (a - b - c + d) * tx * ty;
   };
 
-  const proc = createProceduralHeightField(cx, cy);
+  // Deterministic, gentle rolling lowland beyond the grid rim: wide (~5 km)
+  // wavelength, small amplitude, so the outer ring stays smooth and calm.
+  const lowland = (sx: number, sy: number): number => {
+    const n = fbm(sx, sy, 1337 ^ 0x0f0f, 5200, 4);
+    return Math.max(ZMIN, Math.min(ZMAX, 130 + 120 * (n - 0.5)));
+  };
 
   return {
     heightAt: (sx: number, sy: number): number => {
@@ -219,10 +232,10 @@ export function createUnifiedHeightField(
       const dxOut = Math.max(x0 - sx, sx - x1, 0);
       const dyOut = Math.max(y0 - sy, sy - y1, 0);
       const d = Math.hypot(dxOut, dyOut);
-      const t = clamp01(d / blend);
-      if (t === 0) return g;
-      const p = proc(sx, sy);
-      return g + (p - g) * t;
+      if (d <= 0) return g;
+      const t = ramp <= 0 ? 1 : _smooth(clamp01(d / ramp));
+      const lo = lowland(sx, sy);
+      return g + (lo - g) * t;
     },
   };
 }
@@ -241,6 +254,13 @@ export function createUnifiedHeightField(
  * thread between batches (`yieldToMain`), so the one-time build never freezes
  * the UI. Normals are analytic central differences of the height function (no
  * index sweep) using the local lattice spacing at each vertex.
+ *
+ * When `haze` is given, ring vertices (anything stepped at `ringCell`, i.e.
+ * outside the backend grid) are additionally faded toward that haze colour in
+ * proportion to their distance beyond the grid rim. The original relief colour
+ * and the per-vertex fade factor are stored on `geo.userData.ringFade` so the
+ * caller can re-aim the fade at the current sky/fog colour (e.g. on a day →
+ * night switch) via `retargetTerrainRingFade`.
  */
 export async function buildStaticTerrainGeometry(
   meta: TerrainMeta,
@@ -248,8 +268,12 @@ export async function buildStaticTerrainGeometry(
   baseY: number,
   spec: StaticTerrainSpec,
   yieldToMain: () => Promise<void>,
+  haze: { r: number; g: number; b: number } | null = null,
 ): Promise<THREE.BufferGeometry> {
   const { x0, y0, width, height } = meta;
+  const cell = meta.cell;
+  const x1 = x0 + (width - 1) * cell;
+  const y1 = y0 + (height - 1) * cell;
   const core = Math.max(1, spec.coreCell);
   const ring = Math.max(core, spec.ringCell);
   const nRing = Math.max(1, Math.ceil(spec.ringReach / ring));
@@ -285,6 +309,12 @@ export async function buildStaticTerrainGeometry(
   const low = { r: 0.88, g: 0.78, b: 0.58 };
   const high = { r: 0.94, g: 0.97, b: 1.0 };
 
+  // Ring vertices only: vertex index + original relief colour + fade factor,
+  // so the haze aim can be re-applied later without re-deriving relief colours.
+  const ringStores: { indices: number[]; relief: number[]; fade: number[] } | null = haze
+    ? { indices: [], relief: [], fade: [] }
+    : null;
+
   const BATCH_ROWS = 48;
   for (let start = 0; start < rows; start += BATCH_ROWS) {
     const end = Math.min(start + BATCH_ROWS, rows);
@@ -295,16 +325,37 @@ export async function buildStaticTerrainGeometry(
         const x = xs[c];
         const dx = colSp[c];
         const h = heightAt(x, z);
-        const o = (r * cols + c) * 3;
+        const i = r * cols + c;
+        const o = i * 3;
         positions[o] = x;
         positions[o + 1] = baseY + h;
         positions[o + 2] = z;
 
         const crest = clamp01((h - rockLine) / rockSpan);
         const vib = 0.05 * Math.sin(x * 0.0017 + z * 0.0009 + h * 0.002);
-        colors[o] = low.r + (high.r - low.r) * crest + vib;
-        colors[o + 1] = low.g + (high.g - low.g) * crest + vib;
-        colors[o + 2] = low.b + (high.b - low.b) * crest + vib;
+        const relR = low.r + (high.r - low.r) * crest + vib;
+        const relG = low.g + (high.g - low.g) * crest + vib;
+        const relB = low.b + (high.b - low.b) * crest + vib;
+        colors[o] = relR;
+        colors[o + 1] = relG;
+        colors[o + 2] = relB;
+
+        // Outer lattice: fade toward haze by distance beyond the grid rim.
+        const inRing = c < nRing || c >= nRing + width || r < nRing || r >= nRing + height;
+        if (inRing && ringStores) {
+          const dxo = Math.max(x0 - x, x - x1, 0);
+          const dyo = Math.max(y0 - z, z - y1, 0);
+          const d = Math.hypot(dxo, dyo);
+          const f = RING_RAMP > 0 ? _smooth(clamp01(d / RING_RAMP)) : 1;
+          if (f > 0) {
+            colors[o] = relR + (haze!.r - relR) * f;
+            colors[o + 1] = relG + (haze!.g - relG) * f;
+            colors[o + 2] = relB + (haze!.b - relB) * f;
+            ringStores.indices.push(i);
+            ringStores.relief.push(relR, relG, relB);
+            ringStores.fade.push(f);
+          }
+        }
 
         const hxm = heightAt(x - dx, z);
         const hxp = heightAt(x + dx, z);
@@ -342,5 +393,39 @@ export async function buildStaticTerrainGeometry(
   geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
   geo.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
   geo.setIndex(new THREE.BufferAttribute(indices, 1));
+  if (ringStores && ringStores.indices.length > 0) {
+    geo.userData.ringFade = {
+      indices: new Uint32Array(ringStores.indices),
+      relief: new Float32Array(ringStores.relief),
+      fade: new Float32Array(ringStores.fade),
+    };
+  }
   return geo;
+}
+
+/**
+ * Re-aim the outer-ring haze fade at a new colour (e.g. the fog/sky colour
+ * after a day → night switch). Only ring vertices are touched, reusing the
+ * relief colours stored at build time, so the fade target can change without
+ * re-sampling or re-tessellating anything.
+ */
+export function retargetTerrainRingFade(
+  geo: THREE.BufferGeometry,
+  haze: { r: number; g: number; b: number },
+): void {
+  const ring: { indices: Uint32Array; relief: Float32Array; fade: Float32Array } | undefined =
+    geo.userData.ringFade;
+  if (!ring) return;
+  const colorAttr = geo.getAttribute("color") as THREE.BufferAttribute;
+  const arr = colorAttr.array as Float32Array;
+  const { indices, relief, fade } = ring;
+  for (let k = 0; k < indices.length; k++) {
+    const o = indices[k] * 3;
+    const f = fade[k];
+    const rl = k * 3;
+    arr[o] = relief[rl] + (haze.r - relief[rl]) * f;
+    arr[o + 1] = relief[rl + 1] + (haze.g - relief[rl + 1]) * f;
+    arr[o + 2] = relief[rl + 2] + (haze.b - relief[rl + 2]) * f;
+  }
+  colorAttr.needsUpdate = true;
 }

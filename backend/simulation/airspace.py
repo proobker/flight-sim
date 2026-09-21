@@ -12,7 +12,14 @@ import numpy as np
 
 from .fleet import AircraftType
 from . import physics
-from .terrain import TERRAIN_MIN_CLEARANCE, TerrainGrid, flatten_airports, relief_mesh, terrace_radii
+from .terrain import (
+    CRUISE_TERRAIN_BUFFER,
+    TERRAIN_MIN_CLEARANCE,
+    TerrainGrid,
+    flatten_airports,
+    relief_mesh,
+    terrace_radii,
+)
 
 AIRPORT_NAMES = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"]
 
@@ -37,6 +44,21 @@ TERMINAL_RADIUS = 40000.0
 def random_cruise_altitude(rng=None) -> float:
     rng = rng or random
     return rng.choice(ALTITUDE_BANDS) + rng.uniform(-150.0, 150.0)
+
+
+def cruise_altitude_over_route(band_alt: float, terrain, hold, dest) -> float:
+    """Raise a band-based cruise altitude clear of the terrain along hold→dest.
+
+    Without this, a route over the central massif cruises below the crests and
+    the TAWS floor shoves the flight onto TERRAIN_MIN_CLEARANCE (250 m) above the
+    ridge line, which reads as the aircraft scraping the ground. Raising the
+    cruise by CRUISE_TERRAIN_BUFFER over the route's tallest crest keeps the
+    planned altitude above every crest, so cruise stays smooth and well clear.
+    """
+    if terrain is None:
+        return band_alt
+    crest, _ = terrain.max_along(hold, dest, step=200.0)
+    return max(band_alt, crest + CRUISE_TERRAIN_BUFFER)
 
 
 @dataclass
