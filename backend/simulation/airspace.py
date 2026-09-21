@@ -513,6 +513,14 @@ class Airspace:
             return 0.0
         return self.terrain.height_at(x, y)
 
+    def ground_alt(self, x: float, y: float, fallback: float) -> float:
+        """Altitude for an object sitting on the ground at (x, y): the local
+        terrain surface, never below it. Ground holds / spawns use this so a
+        craft standing anywhere can never sink into the heightfield."""
+        if self.terrain is None:
+            return fallback
+        return max(fallback, self.terrain.height_at(x, y))
+
     def terrain_detour_waypoint(
         self,
         a: tuple[float, float, float],

@@ -118,7 +118,7 @@ class Simulator:
         fleet = assign_type(self._rng, hub=start.hub)
         slot = int(aid[-1]) % 4
         hold = dep_rwy.departure_hold_point(slot)
-        hold = (hold[0], hold[1], dep_rwy.elevation)
+        hold = (hold[0], hold[1], self.airspace.ground_alt(hold[0], hold[1], dep_rwy.elevation))
         ac = Aircraft(
             aircraft_id=aid,
             position=hold,

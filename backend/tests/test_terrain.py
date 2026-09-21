@@ -143,6 +143,40 @@ def test_generated_airports_sit_on_raised_plateaus(real_airspace):
         assert apt.position[2] <= med + 550.0, f"{apt.aid} floats absurdly high"
 
 
+def test_runway_thresholds_and_holds_sit_on_terrain(real_airspace):
+    """Landing thresholds and every departure hold pad stand at or above the
+    terrain surface — nothing spawns or sets down below the heightfield."""
+    for apt in real_airspace.airports:
+        for r in apt.runways:
+            tx, ty, te = r.threshold
+            assert real_airspace.terrain_height(tx, ty) <= te + 0.5, r.rid
+            for slot in range(4):
+                hp = r.departure_hold_point(slot)
+                assert real_airspace.terrain_height(hp[0], hp[1]) <= hp[2] + 0.5, f"{r.rid} hold {slot}"
+
+
+def test_ground_alt_never_below_terrain(real_airspace):
+    for apt in real_airspace.airports:
+        x, y, _ = apt.position
+        surf = real_airspace.terrain_height(x, y)
+        # A bogus-low fallback is raised to the surface.
+        assert real_airspace.ground_alt(x, y, surf - 500.0) == pytest.approx(surf, abs=0.6)
+        # An already-above-surface fallback is left alone.
+        assert real_airspace.ground_alt(x, y, surf + 1000.0) == pytest.approx(surf + 1000.0)
+
+        for r in apt.runways:
+            for slot in range(4):
+                hp = r.departure_hold_point(slot)
+                above = real_airspace.ground_alt(hp[0], hp[1], r.elevation)
+                assert above >= real_airspace.terrain_height(hp[0], hp[1]) - 0.5
+
+
+def test_ground_alt_with_terrain_disabled():
+    a = Airspace()  # no terrain_seed
+    assert a.terrain is None
+    assert a.ground_alt(12345.0, 54321.0, 500.0) == 500.0
+
+
 def test_generation_is_deterministic():
     a = Airspace(terrain_seed=1234)
     b = Airspace(terrain_seed=1234)
