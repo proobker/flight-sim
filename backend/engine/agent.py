@@ -472,7 +472,12 @@ class AircraftAgent:
         ac.held = True
         ac.speed = 0.0
         ac.plan = None
-        ac.position = ac.destination  # set down on the field
+        dest = ac.destination
+        ac.position = (
+            dest[0],
+            dest[1],
+            self.airspace.ground_alt(dest[0], dest[1], dest[2]),
+        )
         ac.heading = 0.0
         self.hold_timer = random.uniform(8.0, 14.0)
 
@@ -491,10 +496,11 @@ class AircraftAgent:
         dest_rwy = self.airspace.pick_runway(next_port)
         slot = int(ac.id[-1]) % 4
         hold = dep_rwy.departure_hold_point(slot)
-        ac.hold_point = (hold[0], hold[1], dep_rwy.elevation)
+        hold_z = self.airspace.ground_alt(hold[0], hold[1], dep_rwy.elevation)
+        ac.hold_point = (hold[0], hold[1], hold_z)
 
         ac.phase = "taxi_out"
-        ac.position = (hold[0], hold[1], dep_rwy.elevation)
+        ac.position = (hold[0], hold[1], hold_z)
         ac.dep_runway = dep_rwy
         ac.runway = dest_rwy
         ac.dest_airport = next_port
