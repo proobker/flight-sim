@@ -13,9 +13,9 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import type { SimSnapshot, AircraftSnapshot, Airport, TerrainMeta } from "../api/types";
 import {
-  buildTerrainWindowGeometry,
+  buildStaticTerrainGeometry,
   createUnifiedHeightField,
-  type TerrainWindowSpec,
+  type StaticTerrainSpec,
 } from "./terrainField";
 
 const COMM_LINE_COLOR = 0x336688;
@@ -76,16 +76,15 @@ const FOG_FAR = 340000;
 const GROUND_HALF_EXTENT = 1200000;
 const GROUND_CLEARANCE = 80;
 
-// Camera-anchored terrain windows. Every tier is a single heightfield mesh
-// recentred on the camera (origin snaps to the lattice so nothing swims); the
-// uppermost tier spans ~1000 km so it always reaches past the fog. Spacings are
-// powers of two so adjacent tier lattices stay aligned.
-const TERRAIN_WINDOW_SPECS: TerrainWindowSpec[] = [
-  { spacing: 128, cells: 48 }, // ~6.1 km window — crisp detail under the camera
-  { spacing: 512, cells: 48 }, // ~24.6 km
-  { spacing: 2048, cells: 96 }, // ~196 km
-  { spacing: 8192, cells: 128 }, // ~1048 km — past the fog's far edge
-];
+// One static, world-anchored terrain mesh (see buildStaticTerrainGeometry).
+// The coarse ring must reach past the fog's far edge (FOG_FAR) so the world
+// still dissolves at the horizon. The mesh is built once when the elevation
+// grid loads and never rebuilt as the camera moves — no LOD pop, no airport
+// slicing at window boundaries.
+const TERRAIN_RING_REACH = 300000;
+
+/** Yield to the render loop so a multi-batch build never freezes the UI. */
+const yieldToMain = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 // How high above the terrain surface airport buildings sit. The backend sits
 // the flattened field exactly AT every airport's base, so without this lift
@@ -589,12 +588,11 @@ export class SkyScene {
   private heightAt: (sx: number, sy: number) => number = () => 0;
   private terrainGrid: Float32Array | null = null;
   private terrainMeta: TerrainMeta | null = null;
-  private terrainTiers: {
-    mesh: THREE.Mesh;
-    spec: TerrainWindowSpec;
-    originX: number;
-    originZ: number;
-  }[] = [];
+  terrainMesh: THREE.Mesh | null = null;
+
+  /** In-flight terrain build (dedupes concurrent ensureTerrain calls). */
+  private terrainBuildPromise: Promise<void> | null = null;
+  private terrainReady = false;
   private airportGroups: Map<string, THREE.Group> = new Map();
   private airportThemes: Map<string, ThemedMat[]> = new Map();
   private terrainThemes: ThemedMat[] = [];
@@ -710,7 +708,12 @@ export class SkyScene {
       const cx = air ? air.width / 2 : meta.x0 + (meta.width * meta.cell) / 2;
       const cy = air ? air.depth / 2 : meta.y0 + (meta.height * meta.cell) / 2;
       this.heightAt = createUnifiedHeightField(meta, this.terrainGrid, cx, cy).heightAt;
-      this.rebuildTerrain();
+      // The heightfield is now the single ground surface: drop the flat
+      // fallback plane that may have been drawn while the grid was loading.
+      this.removeGround();
+      // Rebuild the static terrain from the new grid (chunked). No-op until a
+      // snapshot is present; update() kicks it off once dimensions are known.
+      await this.ensureTerrain();
       // Airports built on the flat baseline (before the grid was ready) now
       // float up onto their flattened field elevations.
       this.repositionAirportsToTerrain();
@@ -844,7 +847,14 @@ export class SkyScene {
     this.skySun = sun;
   }
 
-  private rebuildGround() {
+  /** True once the authoritative backend elevation grid is loaded. At that
+   * point the heightfield is the ground — the flat plane below is dropped so
+   * only one visible ground surface exists at any world position. */
+  private terrainEnabled(): boolean {
+    return !!this.terrainMeta && !!this.terrainGrid;
+  }
+
+  private removeGround() {
     if (this.groundMesh) {
       this.scene.remove(this.groundMesh);
       (this.groundMesh.material as THREE.MeshLambertMaterial).map?.dispose();
@@ -852,6 +862,14 @@ export class SkyScene {
       this.groundMesh.geometry.dispose();
       this.groundMesh = null;
     }
+  }
+
+  private rebuildGround() {
+    this.removeGround();
+    // Heightfield is the authoritative ground surface wherever terrain is
+    // enabled; the flat fallback plane only exists without it (never render
+    // both over the same (x, z)).
+    if (this.terrainEnabled()) return;
 
     const day = this.viewOptions.dayMode;
     const width = this.lastSnapshot?.airspace.width ?? 15000;
@@ -899,7 +917,6 @@ export class SkyScene {
     requestAnimationFrame(this.animate);
     this.controls.update();
     this.clampCameraToTerrain();
-    this.updateTerrainTiers();
     // Skybox: keep the stars centred on the viewer so zooming out
     // or panning across the 160 km world can never walk out of them.
     if (this.skyStarField) this.skyStarField.position.copy(this.camera.position);
@@ -989,6 +1006,12 @@ export class SkyScene {
   }
 
   private updateGroundIfNeeded() {
+    // Once the elevation grid is here the heightfield owns the ground;
+    // tear down any flat plane left over from the pre-grid frames.
+    if (this.terrainEnabled()) {
+      this.removeGround();
+      return;
+    }
     if (!this.groundMesh) {
       this.rebuildGround();
     }
@@ -999,7 +1022,11 @@ export class SkyScene {
   /**
    * Surface an airport sits on: the backend-flattened field elevation, raised
    * clear of the terrain (AIRPORT_GROUND_CLEARANCE) so the pad and terminal
-   * bed read as placed on the field instead of coplanar/sunk into it. Never
+   * bed read as placed on the field instead of coplanar/sunk into it. Uses the
+   * exact same datum as the heightfield (baseY + heightAt(x, z)) — the backend
+   * raises the grid onto a flat terrace where heightAt(center) == center[2] —
+   * so the `Math.max` is a no-op once the grid is loaded and only keeps the
+   * field from floating *below* its own base before the grid arrives. Never
    * sinks below the airport's own altitude (center[2]) no matter the flatten
    * tolerance or grid timing.
    */
@@ -1185,19 +1212,33 @@ export class SkyScene {
 
 // ────── terrain (hard elevation from the backend grid) ──────
 
+  /**
+   * Build the static terrain once the authoritative grid is ready. The build
+   * is chunked and async (UI stays responsive); concurrent callers share the
+   * in-flight promise. Passed a snapshot, the terrain uses its dimensions for
+   * baseY and clears decorations from airports.
+   */
   private ensureTerrain() {
-    if (this.terrainGroup) return;
+    if (this.terrainReady) return;
     // No authoritative grid → the backend has no terrain; stay flat on the
     // ground plane and match the backend's behaviour.
     if (!this.terrainMeta || !this.terrainGrid) return;
-    const group = new THREE.Group();
-    this.terrainGroup = group;
-    this.scene.add(group);
-    this.buildTerrain(group);
+    if (!this.terrainBuildPromise) {
+      this.terrainBuildPromise = (async () => {
+        try {
+          await this.buildTerrainFromGrid();
+        } catch (err) {
+          console.error("[terrain] build failed", err);
+        } finally {
+          this.terrainBuildPromise = null;
+        }
+      })();
+    }
+    return this.terrainBuildPromise;
   }
 
-  /** Rebuild when the authoritative elevation grid arrives from the backend. */
-  private rebuildTerrain() {
+  /** Remove and dispose every terrain visual (mesh, decor, materials). */
+  private disposeTerrain() {
     if (this.terrainGroup) {
       this.scene.remove(this.terrainGroup);
       this.terrainGroup.traverse((child) => {
@@ -1208,26 +1249,26 @@ export class SkyScene {
           m.dispose();
         }
       });
-      this.terrainThemes = [];
-      this.terrainTiers = [];
+      this.terrainGroup = null;
+      this.terrainMesh = null;
     }
     this.terrainMat = null;
-    this.terrainGroup = null;
-    if (this.lastSnapshot) this.ensureTerrain();
+    this.terrainThemes = [];
+    this.terrainReady = false;
   }
 
-  private buildTerrain(group: THREE.Group) {
-    const air = this.lastSnapshot!.airspace;
-    const meta = this.terrainMeta!;
-    const hasGrid = !!meta && !!this.terrainGrid;
+  /** Rebuild the static terrain from the authoritative elevation grid. */
+  private async buildTerrainFromGrid() {
+    const air = this.lastSnapshot?.airspace;
+    if (!air) return; // wait for a snapshot so dimensions/airports are known
+    this.disposeTerrain();
 
-    // Full extent of the authoritative elevation grid (or a small flat
-    // fallback when the backend has no terrain).
-    const regionHalf = hasGrid ? Math.round((meta.height - 1) * meta.cell / 2) : 15000;
+    const meta = this.terrainMeta!;
     const baseY = air.floor - GROUND_CLEARANCE;
     const areaCX = air.width / 2;
     const areaCZ = air.depth / 2;
     const rnd = mulberry32(1337);
+    const regionHalf = Math.round((meta.height - 1) * meta.cell / 2);
 
     const airports = air.airports.map((a) => ({
       lx: a.center[0] - areaCX,
@@ -1235,19 +1276,27 @@ export class SkyScene {
       r: a.radius,
     }));
 
-    // ── infinite heightfield: camera-anchored LOD windows, all sampling the
-    // unified height function (grid core + procedural beyond). The window
-    // geometry is (re)built by updateTerrainTiers as the camera moves.
+    // ── static heightfield: one world-anchored structured grid (fine over
+    // the backend grid, coarsening ring beyond), built once. It never moves
+    // or re-tessellates with the camera, so there is no LOD pop and airports
+    // can never be sliced by a window boundary.
+    const group = new THREE.Group();
+    this.terrainGroup = group;
+    this.scene.add(group);
     this.terrainMat = new THREE.MeshLambertMaterial({ vertexColors: true });
-    for (const spec of TERRAIN_WINDOW_SPECS) {
-      const mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.terrainMat);
-      mesh.castShadow = false;
-      mesh.receiveShadow = true;
-      mesh.frustumCulled = false;
-      group.add(mesh);
-      this.terrainTiers.push({ mesh, spec, originX: NaN, originZ: NaN });
-    }
-    this.updateTerrainTiers();
+
+    const spec: StaticTerrainSpec = {
+      coreCell: meta.cell,
+      ringCell: meta.cell * 8,
+      ringReach: TERRAIN_RING_REACH,
+    };
+    const geo = await buildStaticTerrainGeometry(meta, this.heightAt, baseY, spec, yieldToMain);
+    const mesh = new THREE.Mesh(geo, this.terrainMat);
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false;
+    group.add(mesh);
+    this.terrainMesh = mesh;
 
     const clearOf = (x: number, z: number, r: number) =>
       airports.every((a) => Math.hypot(x - areaCX - a.lx, z - areaCZ - a.lz) > r);
@@ -1314,6 +1363,7 @@ export class SkyScene {
     }
 
     this.applyTerrainTheme(this.viewOptions.dayMode);
+    this.terrainReady = true;
   }
 
   private applyTerrainTheme(day: boolean) {
@@ -1322,45 +1372,6 @@ export class SkyScene {
     }
     for (const t of this.terrainThemes) {
       t.mat.color.setHex(day ? t.day : t.night);
-    }
-  }
-
-  /**
-   * Keep each LOD window centred on the camera. The window origin snaps to the
-   * tier's lattice, so the sampled vertex grid is always a subset of the world
-   * lattice — the terrain never swims, and every tier rebuilds only when the
-   * camera actually crosses into a new lattice cell.
-   */
-  private updateTerrainTiers() {
-    if (!this.terrainGroup || !this.terrainMeta || !this.terrainGrid) return;
-    const air = this.lastSnapshot!.airspace;
-    const baseY = air.floor - GROUND_CLEARANCE;
-    const meta = this.terrainMeta;
-    const rockLine = meta.zmin + 0.5 * (meta.zmax - meta.zmin);
-    const rockSpan = Math.max(1, meta.zmax - rockLine);
-    const camX = this.camera.position.x;
-    const camZ = this.camera.position.z;
-
-    for (const tier of this.terrainTiers) {
-      const { spec } = tier;
-      const sn = Math.floor(camX / spec.spacing) - Math.floor(spec.cells / 2);
-      const tn = Math.floor(camZ / spec.spacing) - Math.floor(spec.cells / 2);
-      const originX = sn * spec.spacing;
-      const originZ = tn * spec.spacing;
-      if (originX === tier.originX && originZ === tier.originZ) continue;
-      tier.originX = originX;
-      tier.originZ = originZ;
-      const old = tier.mesh.geometry as THREE.BufferGeometry;
-      tier.mesh.geometry = buildTerrainWindowGeometry(
-        originX,
-        originZ,
-        spec,
-        this.heightAt,
-        baseY,
-        rockLine,
-        rockSpan,
-      );
-      old.dispose();
     }
   }
 

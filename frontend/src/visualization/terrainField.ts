@@ -13,8 +13,10 @@
  *     inside the grid, an eased crossfade to the procedural field across a
  *     band just outside its rim, and pure procedural relief beyond — so the
  *     world reads as one endless landscape.
- *   - `buildTerrainWindowGeometry` snapshots that height function into a
- *     camera-anchored (but world-aligned) heightfield window for display.
+ *   - `buildStaticTerrainGeometry` snapshots that height function into one
+ *     world-anchored structured grid (fine over the backend grid, coarsening
+ *     beyond it) for display — built once and never re-anchored, so the
+ *     rendered ground never changes as the camera moves.
  */
 
 import * as THREE from "three";
@@ -24,9 +26,14 @@ export interface HeightField {
   heightAt: (x: number, z: number) => number;
 }
 
-export interface TerrainWindowSpec {
-  spacing: number;
-  cells: number;
+export interface StaticTerrainSpec {
+  /** Lattice spacing inside the authoritative backend grid (m). */
+  coreCell: number;
+  /** Lattice spacing of the outer ring (m). A multiple of coreCell keeps the
+   * lattice aligned so the tessellation coarsens without seams. */
+  ringCell: number;
+  /** How far the coarse ring extends beyond the backend grid bounds (m). */
+  ringReach: number;
 }
 
 const ZMIN = 100.0;
@@ -221,61 +228,119 @@ export function createUnifiedHeightField(
 }
 
 /**
- * Heightfield mesh over a camera-anchored window. The origin snaps to the tier
- * lattice (every origin is a multiple of `spec.spacing`, local vertices are
- * integer multiples too), so the window never swims relative to the world and
- * every lattice point is always sampled with the same value.
+ * One static, world-anchored heightfield mesh for the whole visible world.
+ *
+ * A structured grid whose columns/rows run: coarse ring (below the grid) at
+ * `ringCell`, the authoritative backend grid at `coreCell`, then a coarse ring
+ * again — one lattice, so the mesh is a single watertight surface with no
+ * T-junctions or seams. Built once and never anchored to the camera, so the
+ * tessellation (and the per-vertex relief colouring) is frozen: moving the
+ * camera can no longer re-shape or re-texture the ground.
+ *
+ * Fills position/color/normal attributes in row batches, yielding to the main
+ * thread between batches (`yieldToMain`), so the one-time build never freezes
+ * the UI. Normals are analytic central differences of the height function (no
+ * index sweep) using the local lattice spacing at each vertex.
  */
-export function buildTerrainWindowGeometry(
-  originX: number,
-  originZ: number,
-  spec: TerrainWindowSpec,
+export async function buildStaticTerrainGeometry(
+  meta: TerrainMeta,
   heightAt: (x: number, z: number) => number,
   baseY: number,
-  rockLine: number,
-  rockSpan: number,
-): THREE.BufferGeometry {
-  const { spacing, cells } = spec;
-  const cols = cells + 1;
-  const vertexCount = cols * cols;
-  const positions = new Float32Array(vertexCount * 3);
-  const colors = new Float32Array(vertexCount * 3);
-  const indices: number[] = [];
+  spec: StaticTerrainSpec,
+  yieldToMain: () => Promise<void>,
+): Promise<THREE.BufferGeometry> {
+  const { x0, y0, width, height } = meta;
+  const core = Math.max(1, spec.coreCell);
+  const ring = Math.max(core, spec.ringCell);
+  const nRing = Math.max(1, Math.ceil(spec.ringReach / ring));
 
+  // Ascending lattice coordinates: ring lows, core, ring highs.
+  const xs: number[] = [];
+  for (let k = nRing; k >= 1; k--) xs.push(x0 - k * ring);
+  for (let i = 0; i < width; i++) xs.push(x0 + i * core);
+  for (let k = 1; k <= nRing; k++) xs.push(x0 + (width - 1) * core + k * ring);
+  const zs: number[] = [];
+  for (let k = nRing; k >= 1; k--) zs.push(y0 - k * ring);
+  for (let j = 0; j < height; j++) zs.push(y0 + j * core);
+  for (let k = 1; k <= nRing; k++) zs.push(y0 + (height - 1) * core + k * ring);
+
+  const cols = xs.length;
+  const rows = zs.length;
+  const n = cols * rows;
+
+  // Local lattice spacing per column/row (used for the normal stencil).
+  const colSp = new Float32Array(cols);
+  for (let c = 0; c < cols; c++) colSp[c] = c < nRing || c >= nRing + width ? ring : core;
+  const rowSp = new Float32Array(rows);
+  for (let r = 0; r < rows; r++) rowSp[r] = r < nRing || r >= nRing + height ? ring : core;
+
+  const positions = new Float32Array(n * 3);
+  const colors = new Float32Array(n * 3);
+  const normals = new Float32Array(n * 3);
+
+  // Same relief colour recipe as the old per-window build: tan lowlands rising
+  // to bright rock crests with a faint deterministic dapple.
+  const rockLine = meta.zmin + 0.5 * (meta.zmax - meta.zmin);
+  const rockSpan = Math.max(1, meta.zmax - rockLine);
   const low = { r: 0.88, g: 0.78, b: 0.58 };
   const high = { r: 0.94, g: 0.97, b: 1.0 };
 
-  for (let r = 0; r < cols; r++) {
-    const z = originZ + r * spacing;
-    for (let c = 0; c < cols; c++) {
-      const x = originX + c * spacing;
-      const hgt = heightAt(x, z);
-      const i = r * cols + c;
-      positions[i * 3 + 0] = x;
-      positions[i * 3 + 1] = baseY + hgt;
-      positions[i * 3 + 2] = z;
+  const BATCH_ROWS = 48;
+  for (let start = 0; start < rows; start += BATCH_ROWS) {
+    const end = Math.min(start + BATCH_ROWS, rows);
+    for (let r = start; r < end; r++) {
+      const z = zs[r];
+      const dz = rowSp[r];
+      for (let c = 0; c < cols; c++) {
+        const x = xs[c];
+        const dx = colSp[c];
+        const h = heightAt(x, z);
+        const o = (r * cols + c) * 3;
+        positions[o] = x;
+        positions[o + 1] = baseY + h;
+        positions[o + 2] = z;
 
-      const crest = clamp01((hgt - rockLine) / rockSpan);
-      const vib = 0.05 * Math.sin(x * 0.0017 + z * 0.0009 + hgt * 0.002);
-      colors[i * 3 + 0] = low.r + (high.r - low.r) * crest + vib;
-      colors[i * 3 + 1] = low.g + (high.g - low.g) * crest + vib;
-      colors[i * 3 + 2] = low.b + (high.b - low.b) * crest + vib;
+        const crest = clamp01((h - rockLine) / rockSpan);
+        const vib = 0.05 * Math.sin(x * 0.0017 + z * 0.0009 + h * 0.002);
+        colors[o] = low.r + (high.r - low.r) * crest + vib;
+        colors[o + 1] = low.g + (high.g - low.g) * crest + vib;
+        colors[o + 2] = low.b + (high.b - low.b) * crest + vib;
+
+        const hxm = heightAt(x - dx, z);
+        const hxp = heightAt(x + dx, z);
+        const hzm = heightAt(x, z - dz);
+        const hzp = heightAt(x, z + dz);
+        const nx = -(hxp - hxm) / (2 * dx);
+        const nz = -(hzp - hzm) / (2 * dz);
+        const len = Math.hypot(nx, 1, nz) || 1;
+        normals[o] = nx / len;
+        normals[o + 1] = 1 / len;
+        normals[o + 2] = nz / len;
+      }
     }
+    if (end < rows) await yieldToMain();
   }
 
-  for (let r = 0; r < cells; r++) {
-    for (let c = 0; c < cells; c++) {
+  const indexCount = (rows - 1) * (cols - 1) * 6;
+  const indices = n > 65535 ? new Uint32Array(indexCount) : new Uint16Array(indexCount);
+  let k = 0;
+  for (let r = 0; r < rows - 1; r++) {
+    for (let c = 0; c < cols - 1; c++) {
       const a = r * cols + c;
       const b = a + cols;
-      indices.push(a, b, a + 1);
-      indices.push(a + 1, b, b + 1);
+      indices[k++] = a;
+      indices[k++] = b;
+      indices[k++] = a + 1;
+      indices[k++] = a + 1;
+      indices[k++] = b;
+      indices[k++] = b + 1;
     }
   }
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-  geo.setIndex(indices);
-  geo.computeVertexNormals();
+  geo.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+  geo.setIndex(new THREE.BufferAttribute(indices, 1));
   return geo;
 }
