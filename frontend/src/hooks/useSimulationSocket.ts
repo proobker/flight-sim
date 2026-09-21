@@ -17,6 +17,7 @@ export function useSimulationSocket(): {
   useEffect(() => {
     let alive = true;
     let retryTimeout: ReturnType<typeof setTimeout> | undefined;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
 
     function connect() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -25,6 +26,11 @@ export function useSimulationSocket(): {
 
       ws.onopen = () => {
         if (alive) setConnected(true);
+        // Keep the connection (and hosted free tiers that sleep on inbound
+        // inactivity) awake with a lightweight client-to-server heartbeat.
+        heartbeat = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+        }, 30000);
       };
 
       ws.onmessage = (ev) => {
@@ -37,6 +43,7 @@ export function useSimulationSocket(): {
       };
 
       ws.onclose = () => {
+        if (heartbeat) clearInterval(heartbeat);
         if (alive) {
           setConnected(false);
           retryTimeout = setTimeout(connect, 1500);
@@ -53,6 +60,7 @@ export function useSimulationSocket(): {
     return () => {
       alive = false;
       clearTimeout(retryTimeout);
+      if (heartbeat) clearInterval(heartbeat);
       wsRef.current?.close();
     };
   }, []);

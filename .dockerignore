@@ -1,0 +1,29 @@
+.git
+.gitignore
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+build/
+
+# Secrets / editor / OS
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs
+docs/

@@ -78,10 +78,32 @@ class UdpNode:
     def bind(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
         sock.bind(("", self.port))
         if ipaddress.ip_address(self.group).is_multicast:
-            mreq = socket.inet_aton(self.group) + socket.inet_aton("0.0.0.0")
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            # All peers live in this process, so pin multicast to the loopback
+            # interface. Relying on the default interface fails in container /
+            # cloud network namespaces that filter multicast traffic.
+            loopback = socket.inet_aton("127.0.0.1")
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, loopback)
+                mreq = socket.inet_aton(self.group) + loopback
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            except OSError:
+                # Fall back to the default interface on platforms that cannot
+                # multicast over loopback.
+                default = socket.inet_aton("0.0.0.0")
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, default)
+                except OSError:
+                    pass
+                mreq = socket.inet_aton(self.group) + default
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.setblocking(False)
         self._socket = sock
 

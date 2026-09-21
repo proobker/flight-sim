@@ -154,6 +154,27 @@ Deterministic tie-breaking: priority → cost → trajectory version → aircraf
 python -m pytest backend/tests -v
 ```
 
+## Deploy (Render free tier + Cloudflare DNS)
+
+The repo ships a `Dockerfile` (builds the frontend, runs the backend) and a
+`render.yaml` blueprint. One container serves the UI, REST API and WebSocket.
+
+1. **Render** → New → Blueprint (or Web Service) → connect this repo. The
+   blueprint provisions a **free Docker web service** (`flight-sim`).
+2. Add a custom domain in Render: **Settings → Custom Domains →
+   `flightsim.rabidahal.com.np`**.
+3. **Cloudflare DNS** → add a `CNAME` record: `flightsim` → the
+   `<service>.onrender.com` host Render shows. Start **DNS-only (grey cloud)**
+   so Render can issue its TLS certificate, then optionally switch to
+   **proxied (orange)** with SSL/TLS mode set to **Full (strict)**.
+4. Open `https://flightsim.rabidahal.com.np/` and confirm the UI loads, `/docs`
+   responds, and `/ws` streams snapshots.
+
+Free-tier notes: the service sleeps after ~15 min without inbound traffic and
+takes about a minute to wake (the WebSocket heartbeat keeps it awake while a
+browser is watching). The simulation state resets whenever the container
+restarts.
+
 ## Project Structure
 
 ```
