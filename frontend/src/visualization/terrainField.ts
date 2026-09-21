@@ -1,0 +1,281 @@
+/**
+ * terrainField — deterministic, everywhere-defined terrain height sampling.
+ *
+ * The backend serves one authoritative (finite) elevation grid over the
+ * airspace. Beyond that grid the land used to fall away to a flat plane. Here
+ * we extend it to genuinely infinite relief:
+ *
+ *   - `createProceduralHeightField` is a JS port of the backend relief recipe
+ *     (coastal value-noise fBm plains, three spinal ridges, a valley carve),
+ *     evaluated at arbitrary world coordinates so it is continuous across the
+ *     whole plane — no seams, no tiling artefacts, deterministic for a seed.
+ *   - `createUnifiedHeightField` blends the two: exact backend bilinear values
+ *     inside the grid, an eased crossfade to the procedural field across a
+ *     band just outside its rim, and pure procedural relief beyond — so the
+ *     world reads as one endless landscape.
+ *   - `buildTerrainWindowGeometry` snapshots that height function into a
+ *     camera-anchored (but world-aligned) heightfield window for display.
+ */
+
+import * as THREE from "three";
+import type { TerrainMeta } from "../api/types";
+
+export interface HeightField {
+  heightAt: (x: number, z: number) => number;
+}
+
+export interface TerrainWindowSpec {
+  spacing: number;
+  cells: number;
+}
+
+const ZMIN = 100.0;
+const ZMAX = 4700.0;
+
+function _smooth(t: number): number {
+  return t * t * (3.0 - 2.0 * t);
+}
+
+function clamp01(t: number): number {
+  return t < 0 ? 0 : t > 1 ? 1 : t;
+}
+
+// Deterministic 2D integer hash → [0, 1). One (x, z) always maps to one value,
+// so any two windows sampling the same lattice point agree exactly.
+function hash2(ix: number, iz: number, seed: number): number {
+  let h = (seed ^ Math.imul(ix, 0x27d4eb2d) ^ Math.imul(iz, 0x165667b1)) | 0;
+  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+
+// Smooth value noise, continuous everywhere, defined at any scale.
+function valueNoise2(x: number, z: number, seed: number): number {
+  const ix = Math.floor(x);
+  const iz = Math.floor(z);
+  const fx = _smooth(x - ix);
+  const fz = _smooth(z - iz);
+  const v00 = hash2(ix, iz, seed);
+  const v10 = hash2(ix + 1, iz, seed);
+  const v01 = hash2(ix, iz + 1, seed);
+  const v11 = hash2(ix + 1, iz + 1, seed);
+  const a = v00 + (v10 - v00) * fx;
+  const b = v01 + (v11 - v01) * fx;
+  return a + (b - a) * fz;
+}
+
+// fBm / ridged value noise (octave lattice halving, matched to the backend
+// `_noise_field`). Returns values in [0, 1].
+function fbm(
+  x: number,
+  z: number,
+  seed: number,
+  scale0: number,
+  octaves: number,
+  ridged = false,
+): number {
+  let total = 0;
+  let norm = 0;
+  let amp = 1;
+  let scale = scale0;
+  for (let o = 0; o < octaves; o++) {
+    let v = valueNoise2(x / scale, z / scale, (seed + o * 1013904223) | 0);
+    if (ridged) v = (1 - Math.abs(2 * v - 1)) ** 2;
+    total += amp * v;
+    norm += amp;
+    amp *= 0.5;
+    scale *= 0.5;
+  }
+  return total / norm;
+}
+
+// Valley polyline (absolute metres), from the backend relief build.
+const VALLEY_POLY: [number, number][] = [
+  [40.0, 60.0],
+  [60.0, 52.0],
+  [80.0, 80.0],
+  [100.0, 92.0],
+  [120.0, 105.0],
+].map(([x, y]) => [x * 1000.0, y * 1000.0]);
+
+function valleyDistance(x: number, z: number): number {
+  let best = Infinity;
+  for (let i = 0; i < VALLEY_POLY.length - 1; i++) {
+    const [x1, y1] = VALLEY_POLY[i];
+    const [x2, y2] = VALLEY_POLY[i + 1];
+    const vx = x2 - x1;
+    const vy = y2 - y1;
+    const len2 = vx * vx + vy * vy;
+    const t =
+      len2 < 1e-9 ? 0 : clamp01(((x - x1) * vx + (z - y1) * vy) / len2);
+    const px = x1 + vx * t;
+    const py = y1 + vy * t;
+    const d = Math.hypot(x - px, z - py);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/**
+ * Deterministic procedural elevation at any world point, in the backend's own
+ * world frame (offsets measured from the airspace centre). Style-match, not
+ * numpy-bit-exact: continuous + repeatable, which is all seamless tiling needs.
+ */
+export function createProceduralHeightField(
+  cx: number,
+  cy: number,
+  seed = 1337,
+): (x: number, z: number) => number {
+  const baseSeed = seed ^ 0x5f5f;
+  const s1 = seed ^ 0x1a1a;
+  const s2 = seed ^ 0x2b2b;
+  const s3 = seed ^ 0x3c3c;
+
+  const spine = (
+    lx: number,
+    ly: number,
+    angle: number,
+    width: number,
+    amp: number,
+    alongScale: number,
+    s: number,
+  ): number => {
+    const c = Math.cos(angle);
+    const sn = Math.sin(angle);
+    const across = -lx * sn + ly * c;
+    const along = lx * c + ly * sn;
+    const band = Math.exp(-((across / width) ** 2) / 2);
+    const rn = fbm(along, across, s, alongScale, 4, true);
+    return band * amp * (0.28 + 0.72 * rn);
+  };
+
+  return (x: number, z: number): number => {
+    const lx = x - cx;
+    const ly = z - cy;
+
+    // 1) Coastal plain with soft rolling relief.
+    const base = 200.0 + 150.0 * (fbm(lx, ly, baseSeed, 5200.0, 4) - 0.5);
+
+    // 2) Mountain massif: overlapping ridged spines rising to the NE.
+    const mountains =
+      spine(lx, ly, -0.65, 11000.0, 3600.0, 9000.0, s1) +
+      spine(lx, ly, 0.6, 8000.0, 1800.0, 7000.0, s2) +
+      spine(lx, ly, 1.75, 5500.0, 1000.0, 6000.0, s3);
+
+    // 3) Valley system carved through the lowlands.
+    const vdist = valleyDistance(x, z);
+    const valley = 470.0 * Math.exp(-((vdist / 12000.0) ** 2));
+
+    const h = base + mountains - valley;
+    return Math.max(ZMIN, Math.min(ZMAX, h));
+  };
+}
+
+/**
+ * One height function for the whole world. Inside the authoritative grid the
+ * backend bilinear value is returned exactly (physics/aircraft see the same
+ * land). Across `blend` metres outside the rim the value eases toward the
+ * procedural field, which then continues forever.
+ */
+export function createUnifiedHeightField(
+  meta: TerrainMeta,
+  grid: Float32Array,
+  cx: number,
+  cy: number,
+  blend = 20000,
+): HeightField {
+  const { x0, y0, cell, width, height } = meta;
+  const x1 = x0 + (width - 1) * cell;
+  const y1 = y0 + (height - 1) * cell;
+
+  const bilinear = (sx: number, sy: number): number => {
+    const fx = (sx - x0) / cell;
+    const fy = (sy - y0) / cell;
+    const xi = Math.max(0, Math.min(width - 2, Math.floor(fx)));
+    const yi = Math.max(0, Math.min(height - 2, Math.floor(fy)));
+    const tx = fx - xi;
+    const ty = fy - yi;
+    const a = grid[yi * width + xi];
+    const b = grid[yi * width + xi + 1];
+    const c = grid[(yi + 1) * width + xi];
+    const d = grid[(yi + 1) * width + xi + 1];
+    return a + (b - a) * tx + (c - a) * ty + (a - b - c + d) * tx * ty;
+  };
+
+  const proc = createProceduralHeightField(cx, cy);
+
+  return {
+    heightAt: (sx: number, sy: number): number => {
+      const g = bilinear(sx, sy);
+      const dxOut = Math.max(x0 - sx, sx - x1, 0);
+      const dyOut = Math.max(y0 - sy, sy - y1, 0);
+      const d = Math.hypot(dxOut, dyOut);
+      const t = clamp01(d / blend);
+      if (t === 0) return g;
+      const p = proc(sx, sy);
+      return g + (p - g) * t;
+    },
+  };
+}
+
+/**
+ * Heightfield mesh over a camera-anchored window. The origin snaps to the tier
+ * lattice (every origin is a multiple of `spec.spacing`, local vertices are
+ * integer multiples too), so the window never swims relative to the world and
+ * every lattice point is always sampled with the same value.
+ */
+export function buildTerrainWindowGeometry(
+  originX: number,
+  originZ: number,
+  spec: TerrainWindowSpec,
+  heightAt: (x: number, z: number) => number,
+  baseY: number,
+  rockLine: number,
+  rockSpan: number,
+): THREE.BufferGeometry {
+  const { spacing, cells } = spec;
+  const cols = cells + 1;
+  const vertexCount = cols * cols;
+  const positions = new Float32Array(vertexCount * 3);
+  const colors = new Float32Array(vertexCount * 3);
+  const indices: number[] = [];
+
+  const low = { r: 0.88, g: 0.78, b: 0.58 };
+  const high = { r: 0.94, g: 0.97, b: 1.0 };
+
+  for (let r = 0; r < cols; r++) {
+    const z = originZ + r * spacing;
+    for (let c = 0; c < cols; c++) {
+      const x = originX + c * spacing;
+      const hgt = heightAt(x, z);
+      const i = r * cols + c;
+      positions[i * 3 + 0] = x;
+      positions[i * 3 + 1] = baseY + hgt;
+      positions[i * 3 + 2] = z;
+
+      const crest = clamp01((hgt - rockLine) / rockSpan);
+      const vib = 0.05 * Math.sin(x * 0.0017 + z * 0.0009 + hgt * 0.002);
+      colors[i * 3 + 0] = low.r + (high.r - low.r) * crest + vib;
+      colors[i * 3 + 1] = low.g + (high.g - low.g) * crest + vib;
+      colors[i * 3 + 2] = low.b + (high.b - low.b) * crest + vib;
+    }
+  }
+
+  for (let r = 0; r < cells; r++) {
+    for (let c = 0; c < cells; c++) {
+      const a = r * cols + c;
+      const b = a + cols;
+      indices.push(a, b, a + 1);
+      indices.push(a + 1, b, b + 1);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}

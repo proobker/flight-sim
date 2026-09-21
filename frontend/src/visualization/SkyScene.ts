@@ -12,6 +12,11 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import type { SimSnapshot, AircraftSnapshot, Airport, TerrainMeta } from "../api/types";
+import {
+  buildTerrainWindowGeometry,
+  createUnifiedHeightField,
+  type TerrainWindowSpec,
+} from "./terrainField";
 
 const COMM_LINE_COLOR = 0x336688;
 const STALE_LINE_COLOR = 0x995533;
@@ -61,10 +66,26 @@ function clamp01(t: number): number {
 const NIGHT_FOG_COLOR = 0x0e1818;
 const DAY_FOG_COLOR = 0xcceeff;
 
+// Atmospheric haze: distant terrain fades into the sky colour so the endless
+// relief simply dissolves over the horizon instead of ending at a visible edge.
+const FOG_NEAR = 35000;
+const FOG_FAR = 340000;
+
 // The ground extends far beyond the camera's max zoom so its edge is never
 // visible — the world reads as endless even at the max zoom-out.
 const GROUND_HALF_EXTENT = 1200000;
 const GROUND_CLEARANCE = 80;
+
+// Camera-anchored terrain windows. Every tier is a single heightfield mesh
+// recentred on the camera (origin snaps to the lattice so nothing swims); the
+// uppermost tier spans ~1000 km so it always reaches past the fog. Spacings are
+// powers of two so adjacent tier lattices stay aligned.
+const TERRAIN_WINDOW_SPECS: TerrainWindowSpec[] = [
+  { spacing: 128, cells: 48 }, // ~6.1 km window — crisp detail under the camera
+  { spacing: 512, cells: 48 }, // ~24.6 km
+  { spacing: 2048, cells: 96 }, // ~196 km
+  { spacing: 8192, cells: 128 }, // ~1048 km — past the fog's far edge
+];
 
 // How high above the terrain surface airport buildings sit. The backend sits
 // the flattened field exactly AT every airport's base, so without this lift
@@ -90,9 +111,18 @@ const PLANE_SCALE = 0.1;
 // terrace must stay bigger than radius * 1.2 * scale.
 const AIRPORT_SITE_SCALE = 2;
 
-// Sim (x, y, z_alt) → Three (x, z_alt, y)
-function toThree(pos: [number, number, number]): THREE.Vector3 {
-  return new THREE.Vector3(pos[0], pos[2], pos[1]);
+// How far above the terrain surface grounded aircraft sit. Keeps parked /
+// taxiing / lined-up craft clear of the heightfield, the airport decks and the
+// runway slabs without z-fighting, and is the "never below the ground" floor
+// any aircraft that dips under the local surface is clamped up to.
+const GROUND_HOVER = 9;
+
+// Sim (x, y, z_alt) → Three (x, z_alt + baseY, y). Every sim-space object
+// shares the scene's ground datum — baseY (airspace.floor - GROUND_CLEARANCE)
+// is exactly where the heightfield surface and airport decks are drawn — so
+// nothing renders sunk relative to the terrain.
+function toThree(pos: [number, number, number], baseY = 0): THREE.Vector3 {
+  return new THREE.Vector3(pos[0], pos[2] + baseY, pos[1]);
 }
 
 // Deterministic PRNG so terrain is identical on every rebuild.
@@ -367,8 +397,21 @@ class AircraftVisual {
     this.group.add(this.trailLine);
   }
 
-  update(ac: AircraftSnapshot) {
-    const pos = toThree(ac.position);
+  update(
+    ac: AircraftSnapshot,
+    baseY: number,
+    surfaceYAt: (sx: number, sy: number) => number | null,
+  ) {
+    const pos = toThree(ac.position, baseY);
+    // Terrain clamping: sit ground-phase aircraft on the local surface (with
+    // a small hover so they read as parked), and lift ANY aircraft that would
+    // otherwise render below the field. surfaceYAt is null until the backend
+    // elevation grid arrives, at which point planes settle onto the terrain.
+    const surf = surfaceYAt(ac.position[0], ac.position[1]);
+    if (surf !== null) {
+      const minY = surf + GROUND_HOVER;
+      if (GROUND_PHASES.has(ac.phase) || pos.y < minY) pos.y = minY;
+    }
     this.group.position.copy(pos);
 
     // Heading smooths towards the true bearing and the plane banks into the
@@ -450,7 +493,7 @@ class AircraftVisual {
       this.velocityLine.visible = false;
     }
 
-    const dest = toThree(ac.destination);
+    const dest = toThree(ac.destination, baseY);
     const destLocal = dest.clone().sub(pos);
     if (destLocal.length() > 100) {
       this.destinationLine.geometry.dispose();
@@ -464,7 +507,7 @@ class AircraftVisual {
     }
 
     if (ac.waypoint) {
-      const wp = toThree(ac.waypoint);
+      const wp = toThree(ac.waypoint, baseY);
       const wpLocal = wp.clone().sub(pos);
       if (wpLocal.length() > 50) {
         this.waypointLine.geometry.dispose();
@@ -546,9 +589,30 @@ export class SkyScene {
   private heightAt: (sx: number, sy: number) => number = () => 0;
   private terrainGrid: Float32Array | null = null;
   private terrainMeta: TerrainMeta | null = null;
+  private terrainTiers: {
+    mesh: THREE.Mesh;
+    spec: TerrainWindowSpec;
+    originX: number;
+    originZ: number;
+  }[] = [];
   private airportGroups: Map<string, THREE.Group> = new Map();
   private airportThemes: Map<string, ThemedMat[]> = new Map();
   private terrainThemes: ThemedMat[] = [];
+
+  /** The scene's ground datum: sim altitude z renders at world Y = baseY + z. */
+  private baseY(): number {
+    return (this.lastSnapshot?.airspace.floor ?? 100) - GROUND_CLEARANCE;
+  }
+
+  /**
+   * World Y of the terrain surface at a sim point, or null until the backend
+   * elevation grid has loaded. Used to clamp aircraft (and equivalent to the
+   * airport decks' ground plane) onto the field.
+   */
+  private groundSurfaceY(sx: number, sy: number): number | null {
+    if (!this.terrainMeta || !this.terrainGrid) return null;
+    return this.baseY() + this.heightAt(sx, sy);
+  }
 
   private lastSnapshot: SimSnapshot | null = null;
 
@@ -568,6 +632,7 @@ export class SkyScene {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
+    this.scene.fog = new THREE.Fog(NIGHT_FOG_COLOR, FOG_NEAR, FOG_FAR);
 
     this.camera = new THREE.PerspectiveCamera(55, w / h, 50, 600000);
     this.camera.position.set(6000, 9000, 18000);
@@ -639,22 +704,12 @@ export class SkyScene {
       // float32 (864 KB-ish) is the backend contract; tolerate float64 so a
       // future dtype slip can never blank the landscape silently again.
       this.terrainGrid = buf.byteLength === f64 ? new Float32Array(new Float64Array(buf)) : new Float32Array(buf);
-      // Bilinear lookup over the backend grid (row = y, col = x).
-      this.heightAt = (sx: number, sy: number) => {
-        const { x0, y0, cell, width } = meta;
-        const fx = (sx - x0) / cell;
-        const fy = (sy - y0) / cell;
-        const xi = Math.max(0, Math.min(meta.width - 2, Math.floor(fx)));
-        const yi = Math.max(0, Math.min(meta.height - 2, Math.floor(fy)));
-        const tx = fx - xi;
-        const ty = fy - yi;
-        const g = this.terrainGrid!;
-        const a = g[yi * width + xi];
-        const b = g[yi * width + xi + 1];
-        const c = g[(yi + 1) * width + xi];
-        const d = g[(yi + 1) * width + xi + 1];
-        return a + (b - a) * tx + (c - a) * ty + (a - b - c + d) * tx * ty;
-      };
+      // Unified height field: authoritative bilinear inside the backend grid,
+      // easing into deterministic procedural relief beyond it (endless world).
+      const air = this.lastSnapshot?.airspace;
+      const cx = air ? air.width / 2 : meta.x0 + (meta.width * meta.cell) / 2;
+      const cy = air ? air.depth / 2 : meta.y0 + (meta.height * meta.cell) / 2;
+      this.heightAt = createUnifiedHeightField(meta, this.terrainGrid, cx, cy).heightAt;
       this.rebuildTerrain();
       // Airports built on the flat baseline (before the grid was ready) now
       // float up onto their flattened field elevations.
@@ -709,6 +764,7 @@ export class SkyScene {
     const clearColor = day ? DAY_FOG_COLOR : NIGHT_FOG_COLOR;
 
     this.renderer.setClearColor(clearColor);
+    if (this.scene.fog) this.scene.fog.color.setHex(clearColor);
 
 // Scene lighting: daytime sun keeps the full day values; at night a bright
     // blue moon keeps the terrain/ground clearly visible, while the glowing
@@ -843,6 +899,7 @@ export class SkyScene {
     requestAnimationFrame(this.animate);
     this.controls.update();
     this.clampCameraToTerrain();
+    this.updateTerrainTiers();
     // Skybox: keep the stars centred on the viewer so zooming out
     // or panning across the 160 km world can never walk out of them.
     if (this.skyStarField) this.skyStarField.position.copy(this.camera.position);
@@ -947,9 +1004,7 @@ export class SkyScene {
    * tolerance or grid timing.
    */
   private airportGroundY(apt: Airport): number {
-    const air = this.lastSnapshot!.airspace;
-    const baseY = air.floor - GROUND_CLEARANCE;
-    return baseY + Math.max(this.heightAt(apt.center[0], apt.center[1]), apt.center[2]) + AIRPORT_GROUND_CLEARANCE;
+    return this.baseY() + Math.max(this.heightAt(apt.center[0], apt.center[1]), apt.center[2]) + AIRPORT_GROUND_CLEARANCE;
   }
 
   /** Keep every airport group on the terrain surface. Early-outs when flush. */
@@ -1028,16 +1083,16 @@ export class SkyScene {
       const rotY = r.heading - Math.PI / 2;
 
       const stripMat = new THREE.MeshPhongMaterial({ opacity: 0.92, transparent: true });
-      const strip = new THREE.Mesh(new THREE.BoxGeometry(r.length, 8 * S, 50 * S), stripMat);
-      strip.position.set(cx, groundY + 7 * S, cz);
+      const strip = new THREE.Mesh(new THREE.BoxGeometry(r.length, 2 * S, 46 * S), stripMat);
+      strip.position.set(cx, groundY + 2 * S, cz);
       strip.rotation.y = rotY;
       strip.receiveShadow = true;
       group.add(strip);
       themes.push({ mat: stripMat, day: 0x3a3d42, night: 0x14161a, closed: 0x4a2f2c });
 
       const lineMat = new THREE.MeshPhongMaterial({ opacity: 0.95, transparent: true });
-      const line = new THREE.Mesh(new THREE.BoxGeometry(r.length, 10 * S, 6 * S), lineMat);
-      line.position.set(cx, groundY + 9 * S, cz);
+      const line = new THREE.Mesh(new THREE.BoxGeometry(r.length, 1.4 * S, 5 * S), lineMat);
+      line.position.set(cx, groundY + 2.8 * S, cz);
       line.rotation.y = rotY;
       group.add(line);
       themes.push({ mat: lineMat, day: 0xe8e8e8, night: 0x99a4b3, closed: 0xbb7777 });
@@ -1132,6 +1187,9 @@ export class SkyScene {
 
   private ensureTerrain() {
     if (this.terrainGroup) return;
+    // No authoritative grid → the backend has no terrain; stay flat on the
+    // ground plane and match the backend's behaviour.
+    if (!this.terrainMeta || !this.terrainGrid) return;
     const group = new THREE.Group();
     this.terrainGroup = group;
     this.scene.add(group);
@@ -1151,21 +1209,21 @@ export class SkyScene {
         }
       });
       this.terrainThemes = [];
+      this.terrainTiers = [];
     }
+    this.terrainMat = null;
     this.terrainGroup = null;
     if (this.lastSnapshot) this.ensureTerrain();
   }
 
   private buildTerrain(group: THREE.Group) {
     const air = this.lastSnapshot!.airspace;
-    const meta = this.terrainMeta;
+    const meta = this.terrainMeta!;
     const hasGrid = !!meta && !!this.terrainGrid;
 
     // Full extent of the authoritative elevation grid (or a small flat
     // fallback when the backend has no terrain).
-    const regionHalf = hasGrid ? Math.round((meta!.height - 1) * meta!.cell / 2) : 15000;
-    const zmin = meta ? meta.zmin : air.floor;
-    const zmax = meta ? meta.zmax : air.floor + 120;
+    const regionHalf = hasGrid ? Math.round((meta.height - 1) * meta.cell / 2) : 15000;
     const baseY = air.floor - GROUND_CLEARANCE;
     const areaCX = air.width / 2;
     const areaCZ = air.depth / 2;
@@ -1177,62 +1235,19 @@ export class SkyScene {
       r: a.radius,
     }));
 
-    // ── heightfield mesh (dense near the sim centre, coarse at the rim) ──
-    const N = 430;
-    const cols = N + 1;
-    const vertexCount = cols * cols;
-    const positions = new Float32Array(vertexCount * 3);
-    const colors = new Float32Array(vertexCount * 3);
-    const indices: number[] = [];
-
-    const compression = 3.1;
-    const tanhC = Math.tanh(compression);
-    const mapU = (u: number) => Math.tanh((u - 0.5) * 2 * compression) / tanhC;
-    const rockLine = zmin + 0.5 * (zmax - zmin);
-    const rockSpan = Math.max(1, zmax - rockLine);
-    const low = { r: 0.88, g: 0.78, b: 0.58 };
-    const high = { r: 0.94, g: 0.97, b: 1.0 };
-
-    for (let r = 0; r < cols; r++) {
-      for (let c = 0; c < cols; c++) {
-        const lx = mapU(c / N) * regionHalf;
-        const ly = mapU(r / N) * regionHalf;
-        const sx = areaCX + lx;
-        const sy = areaCZ + ly;
-        const hgt = this.heightAt(sx, sy);
-        const i = r * cols + c;
-        positions[i * 3 + 0] = sx;
-        positions[i * 3 + 1] = baseY + hgt;
-        positions[i * 3 + 2] = sy;
-
-        // Vertex tint: sandy lowlands rise to icy snowy crests; a faint
-        // puckering keeps broad faces from looking flat.
-        const crest = clamp01((hgt - rockLine) / rockSpan);
-        const vib = 0.05 * Math.sin(sx * 0.0017 + sy * 0.0009 + hgt * 0.002);
-        colors[i * 3 + 0] = low.r + (high.r - low.r) * crest + vib;
-        colors[i * 3 + 1] = low.g + (high.g - low.g) * crest + vib;
-        colors[i * 3 + 2] = low.b + (high.b - low.b) * crest + vib;
-      }
+    // ── infinite heightfield: camera-anchored LOD windows, all sampling the
+    // unified height function (grid core + procedural beyond). The window
+    // geometry is (re)built by updateTerrainTiers as the camera moves.
+    this.terrainMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    for (const spec of TERRAIN_WINDOW_SPECS) {
+      const mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.terrainMat);
+      mesh.castShadow = false;
+      mesh.receiveShadow = true;
+      mesh.frustumCulled = false;
+      group.add(mesh);
+      this.terrainTiers.push({ mesh, spec, originX: NaN, originZ: NaN });
     }
-    for (let r = 0; r < N; r++) {
-      for (let c = 0; c < N; c++) {
-        const a = r * cols + c;
-        const b = a + cols;
-        indices.push(a, b, a + 1);
-        indices.push(a + 1, b, b + 1);
-      }
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-    geo.setIndex(indices);
-    geo.computeVertexNormals();
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
-    const heightfield = new THREE.Mesh(geo, mat);
-    heightfield.castShadow = false;
-    heightfield.receiveShadow = true;
-    group.add(heightfield);
-    this.terrainMat = mat;
+    this.updateTerrainTiers();
 
     const clearOf = (x: number, z: number, r: number) =>
       airports.every((a) => Math.hypot(x - areaCX - a.lx, z - areaCZ - a.lz) > r);
@@ -1298,22 +1313,6 @@ export class SkyScene {
       group.add(rock);
     }
 
-    // far hills — sparse relief toward the horizon, outside the heightfield
-    const farMat = themed(new THREE.MeshLambertMaterial(), 0xc9d5e8, 0x0c1e12);
-    for (let i = 0; i < 40; i++) {
-      const ringR = 34000 + rnd() * 44000;
-      const a = rnd() * Math.PI * 2;
-      const x = areaCX - 7500 + Math.cos(a) * ringR;
-      const z = areaCZ - 7500 + Math.sin(a) * ringR;
-      if (!clearOf(x, z, 3000)) continue;
-      const w0 = 340 + rnd() * 420;
-      const h0 = 30 + rnd() * 110;
-      const far = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 7), farMat);
-      far.scale.set(w0, h0, w0 * (0.8 + rnd() * 0.4));
-      far.position.set(x, baseY + h0 * 0.5, z);
-      group.add(far);
-    }
-
     this.applyTerrainTheme(this.viewOptions.dayMode);
   }
 
@@ -1326,6 +1325,45 @@ export class SkyScene {
     }
   }
 
+  /**
+   * Keep each LOD window centred on the camera. The window origin snaps to the
+   * tier's lattice, so the sampled vertex grid is always a subset of the world
+   * lattice — the terrain never swims, and every tier rebuilds only when the
+   * camera actually crosses into a new lattice cell.
+   */
+  private updateTerrainTiers() {
+    if (!this.terrainGroup || !this.terrainMeta || !this.terrainGrid) return;
+    const air = this.lastSnapshot!.airspace;
+    const baseY = air.floor - GROUND_CLEARANCE;
+    const meta = this.terrainMeta;
+    const rockLine = meta.zmin + 0.5 * (meta.zmax - meta.zmin);
+    const rockSpan = Math.max(1, meta.zmax - rockLine);
+    const camX = this.camera.position.x;
+    const camZ = this.camera.position.z;
+
+    for (const tier of this.terrainTiers) {
+      const { spec } = tier;
+      const sn = Math.floor(camX / spec.spacing) - Math.floor(spec.cells / 2);
+      const tn = Math.floor(camZ / spec.spacing) - Math.floor(spec.cells / 2);
+      const originX = sn * spec.spacing;
+      const originZ = tn * spec.spacing;
+      if (originX === tier.originX && originZ === tier.originZ) continue;
+      tier.originX = originX;
+      tier.originZ = originZ;
+      const old = tier.mesh.geometry as THREE.BufferGeometry;
+      tier.mesh.geometry = buildTerrainWindowGeometry(
+        originX,
+        originZ,
+        spec,
+        this.heightAt,
+        baseY,
+        rockLine,
+        rockSpan,
+      );
+      old.dispose();
+    }
+  }
+
   private updateObstacles(
     obstacles: { id: string; kind: string; center: [number, number, number]; radius: number; height: number }[],
   ) {
@@ -1335,7 +1373,7 @@ export class SkyScene {
     for (const obs of obstacles) {
       if (this.obstacleGroups.has(obs.id)) continue;
       const group = new THREE.Group();
-      const pos3 = toThree(obs.center);
+      const pos3 = toThree(obs.center, this.baseY());
 
       if (obs.kind === "AIRPORT") {
         const padColor = day ? 0x555555 : 0x1a2a1a;
@@ -1397,6 +1435,8 @@ export class SkyScene {
   }
 
   private updateAircraft(aircraft: AircraftSnapshot[]) {
+    const baseY = this.baseY();
+    const surfaceYAt = (sx: number, sy: number) => this.groundSurfaceY(sx, sy);
     const activeIds = new Set(aircraft.map((a) => a.id));
     for (const ac of aircraft) {
       let vis = this.aircraftMap.get(ac.id);
@@ -1409,7 +1449,7 @@ export class SkyScene {
         vis.label.visible = this.viewOptions.showTags;
         this.aircraftMap.set(ac.id, vis);
       }
-      vis.update(ac);
+      vis.update(ac, baseY, surfaceYAt);
     }
     for (const [id, vis] of this.aircraftMap) {
       if (!activeIds.has(id)) {
@@ -1434,8 +1474,9 @@ export class SkyScene {
         drawn.add(key);
         const other = this.aircraftMap.get(otherId);
         if (!other) continue;
+        const self = this.aircraftMap.get(ac.id);
         const geo = new THREE.BufferGeometry().setFromPoints([
-          toThree(ac.position),
+          self ? self.group.position : toThree(ac.position, this.baseY()),
           other.group.position,
         ]);
         const line = new THREE.Line(
@@ -1460,8 +1501,9 @@ export class SkyScene {
         const other = this.aircraftMap.get(nb.id);
         if (!other) continue;
         const color = nb.state === "ACTIVE" ? COMM_LINE_COLOR : STALE_LINE_COLOR;
+        const self = this.aircraftMap.get(ac.id);
         const geo = new THREE.BufferGeometry().setFromPoints([
-          toThree(ac.position),
+          self ? self.group.position : toThree(ac.position, this.baseY()),
           other.group.position,
         ]);
         const line = new THREE.Line(
