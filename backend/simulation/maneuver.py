@@ -76,7 +76,6 @@ def filter_candidates(
         ok = True
 
         end = physics.advance(self_pos, cand.plan.velocity, cand.plan.duration)
-        end = airspace.enforce_bounds(end)
         if not airspace.in_bounds(end):
             ok = False
             reasons.append("out-of-bounds")

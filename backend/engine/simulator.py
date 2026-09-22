@@ -23,8 +23,23 @@ from ..terminal import TerminalController
 from .agent import AircraftAgent
 from .metrics import Metrics
 
-# Ambient wind vector (metres/sec), roughly 8 m/s westerly.
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Ambient wind vector (metres/sec): the air mass moves toward the
+# west-southwest (i.e. the wind is coming FROM the east-northeast, ~063°).
 WIND = (-7.0, -3.5, 0.0)
+
+
+def _wind_direction(vector: tuple[float, float, float]) -> str:
+    """Meteorological compass bearing (degrees, from-north clockwise) that the
+    wind is blowing FROM, derived from the air-mass velocity vector."""
+    vx, vy = float(vector[0]), float(vector[1])
+    if math.hypot(vx, vy) < 1e-9:
+        return "calm"
+    toward = (90.0 - math.degrees(math.atan2(vy, vx))) % 360.0
+    return f"{round((toward + 180.0) % 360.0):03d}°"
 
 
 @dataclass
@@ -66,6 +81,7 @@ class Simulator:
         self.sim_time = 0.0
         self.running = False
         self._task: asyncio.Task | None = None
+        self._broadcast_task: asyncio.Task | None = None
         self._snapshot_callbacks: list = []
         self._rng = random.Random(42)
         self._next_id = itertools.count(1, 1)
@@ -75,10 +91,16 @@ class Simulator:
         await self._spawn_aircraft(self.config.num_aircraft)
         self.running = True
         self._task = asyncio.create_task(self._loop())
-        asyncio.create_task(self._broadcast_loop())
+        self._broadcast_task = asyncio.create_task(self._broadcast_loop())
 
     async def stop(self) -> None:
         self.running = False
+        if self._broadcast_task:
+            self._broadcast_task.cancel()
+            try:
+                await self._broadcast_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._task:
             self._task.cancel()
             try:
@@ -93,11 +115,16 @@ class Simulator:
         self._snapshot_callbacks.append(callback)
 
     # ----- spawn / kill -----
-    async def _spawn_aircraft(self, count: int = 0) -> None:
+    async def _spawn_aircraft(self, count: int | None = None) -> None:
         """Fill the world: `airborne_fraction` of the fleet is already in the
         air (cruise/descent feeding the pattern flows) so traffic is dense
-        from t=0; the rest queue on hold pads waiting for runway clearance."""
-        count = count or self.config.num_aircraft
+        from t=0; the rest queue on hold pads waiting for runway clearance.
+
+        `count=None` spawns the configured fleet size; an explicit `count=0`
+        spawns nothing.
+        """
+        if count is None:
+            count = self.config.num_aircraft
         airborne = int(count * self.config.airborne_fraction)
         for _ in range(count):
             aid = f"A{next(self._next_id):03d}"
@@ -126,7 +153,7 @@ class Simulator:
             speed=0.0,
             heading=dep_rwy.heading,
             cruise_altitude=random_cruise_altitude(self._rng),
-            priority=random.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
+            priority=self._rng.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
             fleet=fleet,
         )
         ac.phase = "taxi_out"
@@ -161,7 +188,7 @@ class Simulator:
             speed=fleet.cruise_speed,
             heading=heading,
             cruise_altitude=altitude,
-            priority=random.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
+            priority=self._rng.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
             fleet=fleet,
         )
         ac.phase = "descent" if physics.h_distance((px, py, altitude), dest) < 36000.0 else CRUISE
@@ -182,6 +209,7 @@ class Simulator:
             multicast_port=self.config.multicast_port,
             loss=self.config.packet_loss,
             latency_ms=self.config.latency_ms,
+            rng=self._rng,
         )
         agent = AircraftAgent(
             aircraft=ac,
@@ -195,6 +223,7 @@ class Simulator:
             comm_range=self.config.comm_range,
             metrics=self.metrics,
             terminal=self.terminal,
+            rng=self._rng,
         )
         if port is not None:
             agent.hold_timer = self._rng.uniform(0.0, 6.0)
@@ -226,6 +255,8 @@ class Simulator:
         agent = self._find_agent(aircraft_id)
         if agent is None:
             return False
+        if not agent.aircraft.active:
+            return False
         agent.aircraft.active = False
         agent.aircraft.plan = None
         agent.aircraft.destination = agent.aircraft.position
@@ -238,7 +269,7 @@ class Simulator:
 
     async def kill_random(self, count: int = 1) -> list[str]:
         ids = [a.id for a in self.agents if a.aircraft.active]
-        targets = random.sample(ids, min(count, len(ids)))
+        targets = self._rng.sample(ids, min(count, len(ids)))
         for tid in targets:
             await self.kill_aircraft(tid)
         return targets
@@ -296,7 +327,7 @@ class Simulator:
         in the air — cruise, descent, even mid-pattern — is rerouted to a new
         open destination so the closed field never receives another landing.
         """
-        target = self.airspace.close_airport(aid)
+        target = self.airspace.close_airport(aid, rng=self._rng)
         if target is None:
             return None
         for agent in self.agents:
@@ -350,7 +381,10 @@ class Simulator:
                 await asyncio.sleep(dt / self.config.sim_speed)
                 self.sim_time += dt
                 for agent in list(self.agents):
-                    agent.step(dt)
+                    try:
+                        agent.step(dt)
+                    except Exception:
+                        logger.exception("agent %s step failed; continuing", agent.id)
                 self._collect_metrics()
         except asyncio.CancelledError:
             return
@@ -424,7 +458,7 @@ class Simulator:
                 "comm_range": self.config.comm_range,
             },
             "airspace": self.airspace.snapshot(),
-            "wind": {"vector": list(WIND), "speed": round(math.hypot(WIND[0], WIND[1]), 1), "direction": "278°"},
+            "wind": {"vector": list(WIND), "speed": round(math.hypot(WIND[0], WIND[1]), 1), "direction": _wind_direction(WIND)},
             "aircraft_count": active_count,
             "total_spawned": total,
             "active": active_count,

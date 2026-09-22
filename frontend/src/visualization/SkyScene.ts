@@ -410,6 +410,11 @@ class AircraftVisual {
     surfaceYAt: (sx: number, sy: number) => number | null,
   ) {
     const pos = toThree(ac.position, baseY);
+    // A stray NaN in the snapshot must not poison the heading/pose smoothing:
+    // hold the last good pose and wait for a finite frame.
+    if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z) || !Number.isFinite(ac.heading)) {
+      return;
+    }
     // Terrain clamping: sit ground-phase aircraft on the local surface (with
     // a small hover so they read as parked), and lift ANY aircraft that would
     // otherwise render below the field. surfaceYAt is null until the backend
@@ -543,16 +548,20 @@ class AircraftVisual {
   }
 
   dispose() {
-    this.group.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        child.geometry.dispose();
-        (child.material as THREE.Material).dispose();
-      }
-      if (child instanceof THREE.Line) {
-        child.geometry.dispose();
-        (child.material as THREE.Material).dispose();
-      }
-    });
+    // Line geometries/materials are per-instance. The airplane bodies share
+    // module-level geometries (procedural parts) or the loaded GLB's geometry,
+    // so only the per-plane materials are released here.
+    for (const line of [this.velocityLine, this.destinationLine, this.waypointLine, this.trailLine]) {
+      line.geometry.dispose();
+      (line.material as THREE.Material).dispose();
+    }
+    if (this.airplaneMat) {
+      this.airplaneMat.dispose();
+    } else if (this.usesGlb) {
+      this.airplane.traverse((o) => {
+        if (o instanceof THREE.Mesh && o.material) (o.material as THREE.Material).dispose();
+      });
+    }
     this.label.material.dispose();
     this.labelMap.dispose();
   }
@@ -585,6 +594,8 @@ export class SkyScene {
 
   // Auto-framed once the first snapshot delivers real airspace dimensions.
   private framedToContent = false;
+  private rafId: number | null = null;
+  private disposed = false;
 
   boundsGroup: THREE.Group;
   skyStarField: THREE.Points | null = null;
@@ -693,6 +704,10 @@ export class SkyScene {
         console.warn("[terrain] disabled in backend — rendering flat");
         return;
       }
+      if (meta.width < 2 || meta.height < 2) {
+        console.warn(`[terrain] grid too small (${meta.width}x${meta.height}) — bilinear sampling needs 2x2 — staying flat`);
+        return;
+      }
       const gridRes = await fetch("/api/terrain/grid");
       if (!gridRes.ok) {
         console.warn(`[terrain] grid request failed (${gridRes.status})`);
@@ -748,8 +763,7 @@ export class SkyScene {
 
     if (prev.showConflicts !== this.viewOptions.showConflicts) {
       if (!this.viewOptions.showConflicts) {
-        this.conflictLines.forEach((l) => this.scene.remove(l));
-        this.conflictLines = [];
+        this.clearLines(this.conflictLines);
       } else if (this.lastSnapshot) {
         this.updateConflicts(this.lastSnapshot.aircraft);
       }
@@ -936,7 +950,8 @@ export class SkyScene {
   }
 
   private animate = () => {
-    requestAnimationFrame(this.animate);
+    if (this.disposed) return;
+    this.rafId = requestAnimationFrame(this.animate);
     this.controls.update();
     this.clampCameraToTerrain();
     // Skybox: keep the stars centred on the viewer so zooming out
@@ -1215,7 +1230,7 @@ export class SkyScene {
           (child.material as THREE.Material).dispose();
         }
         if (child instanceof THREE.Sprite) {
-          child.geometry.dispose();
+          (child.material as THREE.SpriteMaterial).map?.dispose();
           (child.material as THREE.Material).dispose();
         }
       });
@@ -1508,9 +1523,17 @@ export class SkyScene {
     }
   }
 
+  private clearLines(list: THREE.Line[]) {
+    for (const l of list) {
+      this.scene.remove(l);
+      l.geometry.dispose();
+      (l.material as THREE.Material).dispose();
+    }
+    list.length = 0;
+  }
+
   private updateConflicts(aircraft: AircraftSnapshot[]) {
-    this.conflictLines.forEach((l) => this.scene.remove(l));
-    this.conflictLines = [];
+    this.clearLines(this.conflictLines);
 
     if (!this.viewOptions.showConflicts) return;
 
@@ -1538,8 +1561,7 @@ export class SkyScene {
   }
 
   private updateNeighborLines(aircraft: AircraftSnapshot[]) {
-    this.neighborLines.forEach((l) => this.scene.remove(l));
-    this.neighborLines = [];
+    this.clearLines(this.neighborLines);
     const drawn = new Set<string>();
     for (const ac of aircraft) {
       for (const nb of ac.neighbors.slice(0, 15)) {
@@ -1607,8 +1629,13 @@ export class SkyScene {
   }
 
   dispose() {
+    this.disposed = true;
+    if (this.rafId !== null) cancelAnimationFrame(this.rafId);
     window.removeEventListener("resize", this.onResize);
+    this.controls.dispose();
     this.renderer.dispose();
-    this.container.removeChild(this.renderer.domElement);
+    if (this.container.contains(this.renderer.domElement)) {
+      this.container.removeChild(this.renderer.domElement);
+    }
   }
 }

@@ -28,6 +28,12 @@ from ..simulation.negotiation import proposal_consensus_response
 from ..simulation.uncertainty import SilentRegion
 from ..simulation.terrain import TERRAIN_MIN_CLEARANCE
 
+# Silent peers are forgotten once their uncertainty radius has saturated
+# (~121 s at the default base/growth) and then some; pruning bounds the
+# neighbour table so killed/out-of-range aircraft cannot accumulate forever.
+NEIGHBOR_PRUNE_TTL = 400.0
+NEIGHBOR_PRUNE_INTERVAL = 5.0
+
 
 class AircraftAgent:
     def __init__(
@@ -43,6 +49,7 @@ class AircraftAgent:
         comm_range: float = 6000.0,
         metrics=None,
         terminal=None,
+        rng=None,
     ) -> None:
         self.aircraft = aircraft
         self.node = node
@@ -51,6 +58,7 @@ class AircraftAgent:
         self.comm_range = comm_range
         self.metrics = metrics
         self.terminal = terminal
+        self._rng = rng if rng is not None else random.Random()
         self.neighbors = NeighborTable(node_id=aircraft.id)
         self.broadcast_every = broadcast_every
         self.detect_every = detect_every
@@ -65,7 +73,10 @@ class AircraftAgent:
         self._final_registered = False
         self._slot_open: float | None = None
         self._dep_noted = False
+        self._dep_airborne_noted = False
+        self._rollout_noted = False
         self._terrain_wp_at = 0.0
+        self._prune_at = 0.0
 
     @property
     def id(self) -> str:
@@ -109,9 +120,10 @@ class AircraftAgent:
         if sender == self.id:
             return
         pos = msg.get("position")
-        if isinstance(pos, (list, tuple)) and msg.get("velocity"):
-            if math.dist(self.aircraft.position, tuple(pos)) > self.comm_range:
-                return
+        if not (isinstance(pos, (list, tuple)) and len(pos) >= 3):
+            return
+        if math.dist(self.aircraft.position, tuple(pos)) > self.comm_range:
+            return
         self.neighbors.upsert(msg, now)
 
     def _on_proposal(self, msg: dict[str, Any], now: float) -> None:
@@ -285,7 +297,7 @@ class AircraftAgent:
             protocol.message(
                 protocol.TRAJECTORY_PROPOSAL, self.id,
                 target=conflict.other_id,
-                proposal_id=f"{self.id}-{self.aircraft.trajectory_version + 1}-{random.randint(0, 9999)}",
+                proposal_id=f"{self.id}-{self.aircraft.trajectory_version + 1}-{self._rng.randint(0, 9999)}",
                 proposal_version=self.aircraft.proposed_version,
                 maneuver={"velocity": list(best.plan.velocity), "duration": best.plan.duration},
                 cost=plan_cost(best.plan, self.aircraft),
@@ -316,8 +328,7 @@ class AircraftAgent:
         if self.metrics is not None:
             from .metrics import ConflictRecord
 
-            record = ConflictRecord(a=self.id, b=conflict.other_id, detected_at=now,
-                                    maneuver=conflict.other_id)
+            record = ConflictRecord(a=self.id, b=conflict.other_id, detected_at=now)
             self.metrics.record_conflict(record)
             self._open_records = getattr(self, "_open_records", {})
             self._open_records[key] = record
@@ -329,6 +340,8 @@ class AircraftAgent:
             if self.metrics is not None:
                 record = getattr(self, "_open_records", {}).pop(key, None)
                 if record is not None:
+                    plan = self.aircraft.plan
+                    record.maneuver = plan.comment if plan is not None else "none"
                     self.metrics.record_resolution(record, now)
 
     def active_conflict_ids(self) -> list[str]:
@@ -342,6 +355,14 @@ class AircraftAgent:
             return
         self.sim_time += dt
         now = self.sim_time
+
+        # Drop neighbours that have been silent longer than the uncertainty
+        # region can represent, so the world model never grows without bound.
+        # The TTL keeps silent peers around long enough for their uncertainty
+        # radius to saturate before they are forgotten.
+        if now >= self._prune_at:
+            self.neighbors.prune(now, ttl=NEIGHBOR_PRUNE_TTL)
+            self._prune_at = now + NEIGHBOR_PRUNE_INTERVAL
 
         msgs = self.drain_inbox()
         self.apply_messages(msgs, now)
@@ -390,7 +411,7 @@ class AircraftAgent:
         ):
             self._begin_hold()
         elif self.aircraft.phase == "parked" and self.aircraft.held and self.hold_timer <= 0:
-            self.hold_timer = random.uniform(2.0, 6.0)
+            self.hold_timer = self._rng.uniform(2.0, 6.0)
 
         if self.tick % self.broadcast_every == 0:
             self._broadcast_state(now)
@@ -416,7 +437,9 @@ class AircraftAgent:
                 terminal.note_departure(self.id, dr.rid, ac.type_.wake, now)
                 self._dep_noted = True
         elif ac.phase == "climbout" and dr is not None:
-            terminal.note_departure_airborne(dr.rid, now)
+            if not self._dep_airborne_noted:
+                terminal.note_departure_airborne(dr.rid, now)
+                self._dep_airborne_noted = True
         elif ac.phase == "descent":
             if not self._final_registered:
                 eta = now + self._eta_to_join(ac)
@@ -443,11 +466,15 @@ class AircraftAgent:
                 self._slot_open = terminal.request_go_around(self.id, r.rid, ac.type_.wake, eta, now)
                 self._final_registered = True
         elif ac.phase == "rollout":
-            terminal.note_landed(self.id, r.rid, now)
+            if not self._rollout_noted:
+                terminal.note_landed(self.id, r.rid, now)
+                self._rollout_noted = True
         elif ac.phase in ("taxi_in", "parked"):
             self._final_registered = False
             self._slot_open = None
             self._dep_noted = False
+            self._dep_airborne_noted = False
+            self._rollout_noted = False
 
     def _eta_to_join(self, ac: Aircraft) -> float:
         """Approx seconds until this aircraft reaches the final fix."""
@@ -479,7 +506,7 @@ class AircraftAgent:
             self.airspace.ground_alt(dest[0], dest[1], dest[2]),
         )
         ac.heading = 0.0
-        self.hold_timer = random.uniform(8.0, 14.0)
+        self.hold_timer = self._rng.uniform(8.0, 14.0)
 
     def _begin_departure(self) -> None:
         ac = self.aircraft
@@ -490,8 +517,8 @@ class AircraftAgent:
             return
 
         ac.held = False
-        port = self.airspace.airport_by_id(ac.dest_aid) or self.airspace.random_airport()
-        next_port = self.airspace.random_airport(exclude_id=port.aid)
+        port = self.airspace.airport_by_id(ac.dest_aid) or self.airspace.random_airport(self._rng)
+        next_port = self.airspace.random_airport(self._rng, exclude_id=port.aid)
         dep_rwy = port.active_runway(self.airspace.wind)
         dest_rwy = self.airspace.pick_runway(next_port)
         slot = int(ac.id[-1]) % 4
@@ -508,7 +535,7 @@ class AircraftAgent:
         ac.origin_aid = port.aid
         ac.dest_aid = next_port.aid
         ac.cruise_altitude = cruise_altitude_over_route(
-            random_cruise_altitude(),
+            random_cruise_altitude(self._rng),
             self.airspace.terrain,
             ac.hold_point,
             next_port.position,
@@ -529,6 +556,8 @@ class AircraftAgent:
         self._final_registered = False
         self._slot_open = None
         self._dep_noted = False
+        self._dep_airborne_noted = False
+        self._rollout_noted = False
 
     def _broadcast_state(self, now: float) -> None:
         a = self.aircraft

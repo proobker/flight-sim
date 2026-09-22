@@ -283,9 +283,9 @@ class Aircraft:
             if self.phase not in (FINAL, FLARE):
                 tz = max(
                     tz,
-                    self.terrain_height_at(target[0], target[1]),
-                    self.terrain_height_at(self.position[0], self.position[1]),
-                ) + TERRAIN_MIN_CLEARANCE
+                    self.terrain_height_at(target[0], target[1]) + TERRAIN_MIN_CLEARANCE,
+                    self.terrain_height_at(self.position[0], self.position[1]) + TERRAIN_MIN_CLEARANCE,
+                )
         return target, tz, phase_speed
 
     def terrain_height_at(self, x: float, y: float) -> float:

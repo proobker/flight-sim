@@ -432,11 +432,11 @@ class Airspace:
     def next_destination(self, exclude_id: str | None = None) -> tuple[float, float, float]:
         return self.random_airport(exclude_id=exclude_id).position
 
-    def close_airport(self, aid: str | None = None):
+    def close_airport(self, aid: str | None = None, rng=None):
         open_ports = [a for a in self.airports if not a.closed]
         if not open_ports:
             return None
-        target = self.airport_by_id(aid) if aid else random.choice(open_ports)
+        target = self.airport_by_id(aid) if aid else (rng or random).choice(open_ports)
         if target is None:
             return None
         target.closed = True

@@ -202,6 +202,9 @@ export function createUnifiedHeightField(
   ramp = RING_RAMP,
 ): HeightField {
   const { x0, y0, cell, width, height } = meta;
+  if (width < 2 || height < 2) {
+    throw new Error(`[terrain] grid too small (${width}x${height}) — bilinear sampling needs 2x2`);
+  }
   const x1 = x0 + (width - 1) * cell;
   const y1 = y0 + (height - 1) * cell;
 

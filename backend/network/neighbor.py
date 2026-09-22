@@ -77,12 +77,12 @@ class NeighborTable:
             entry = NeighborEntry(aircraft_id=sender)
             self.entries[sender] = entry
         entry.last_seen = now
-        entry.position = _vec(msg.get("position"))
-        entry.velocity = _vec(msg.get("velocity"))
-        entry.heading = float(msg.get("heading", 0.0))
-        entry.speed = float(msg.get("speed", 0.0))
-        entry.vertical_rate = float(msg.get("vertical_rate", 0.0))
-        entry.destination = _vec(msg.get("destination"))
+        entry.position = _vec(msg.get("position"), entry.position)
+        entry.velocity = _vec(msg.get("velocity"), entry.velocity)
+        entry.heading = float(msg.get("heading", entry.heading))
+        entry.speed = float(msg.get("speed", entry.speed))
+        entry.vertical_rate = float(msg.get("vertical_rate", entry.vertical_rate))
+        entry.destination = _vec(msg.get("destination"), entry.destination)
         entry.priority = int(msg.get("priority", 0))
         entry.emergency = bool(msg.get("emergency", False))
         entry.trajectory_version = int(msg.get("trajectory_version", 0))
@@ -119,10 +119,10 @@ class NeighborTable:
         return out
 
 
-def _vec(value: Any) -> tuple[float, float, float]:
+def _vec(value: Any, default: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> tuple[float, float, float]:
     if _valid(value):
         return (float(value[0]), float(value[1]), float(value[2]))
-    return (0.0, 0.0, 0.0)
+    return default
 
 
 def _valid(value: Any) -> bool:

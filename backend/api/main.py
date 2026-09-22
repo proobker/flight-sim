@@ -9,7 +9,7 @@ import os
 import sys
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -47,7 +47,8 @@ def _compress(payload: bytes) -> bytes:
 
 
 def get_sim() -> Simulator:
-    assert sim is not None, "Simulator not initialised"
+    if sim is None:
+        raise HTTPException(status_code=503, detail="Simulator not initialised")
     return sim
 
 
@@ -72,9 +73,11 @@ async def _install_exception_handler() -> None:
     asyncio.get_running_loop().set_exception_handler(_quiet_windows_proactor_noise)
 
 
-async def init_simulator(config: SimConfig | None = None) -> None:
+async def init_simulator(config: SimConfig | None = None, seed: int | None = None) -> None:
     global sim
     sim = Simulator(config)
+    if seed is not None:
+        sim._rng.seed(seed)
     sim.on_snapshot(_broadcast_snapshot)
     await sim.start()
 
@@ -130,14 +133,25 @@ async def terrain_grid():
 
 
 @app.post("/api/control/kill")
-async def kill_aircraft(data: dict[str, Any]):
-    ok = await get_sim().kill_aircraft(data["id"])
+async def kill_aircraft(data: dict[str, Any] | None = None):
+    aid = (data or {}).get("id")
+    if not isinstance(aid, str) or not aid:
+        raise HTTPException(status_code=422, detail="'id' (non-empty string) is required")
+    ok = await get_sim().kill_aircraft(aid)
     return {"ok": ok}
+
+
+def _valid_count(value: Any, name: str = "count", minimum: int = 0, maximum: int = 500) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(status_code=422, detail=f"'{name}' must be an integer")
+    if not minimum <= value <= maximum:
+        raise HTTPException(status_code=422, detail=f"'{name}' must be in [{minimum}, {maximum}]")
+    return value
 
 
 @app.post("/api/control/kill_random")
 async def kill_random(data: dict[str, Any] | None = None):
-    count = (data or {}).get("count", 5)
+    count = _valid_count((data or {}).get("count", 5), maximum=500)
     ids = await get_sim().kill_random(count)
     return {"killed": ids}
 
@@ -161,14 +175,28 @@ async def rejoin_network():
 
 
 @app.post("/api/control/packet_loss")
-async def set_packet_loss(data: dict[str, Any]):
-    get_sim().set_packet_loss(float(data.get("value", 0.0)))
+async def set_packet_loss(data: dict[str, Any] | None = None):
+    value = (data or {}).get("value", 0.0)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="'value' must be numeric")
+    if not 0.0 <= value <= 1.0:
+        raise HTTPException(status_code=422, detail="'value' must be in [0.0, 1.0]")
+    get_sim().set_packet_loss(value)
     return {"ok": True}
 
 
 @app.post("/api/control/latency")
-async def set_latency(data: dict[str, Any]):
-    get_sim().set_latency(float(data.get("ms", 0.0)))
+async def set_latency(data: dict[str, Any] | None = None):
+    ms = (data or {}).get("ms", 0.0)
+    try:
+        ms = float(ms)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="'ms' must be numeric")
+    if ms < 0.0:
+        raise HTTPException(status_code=422, detail="'ms' must be non-negative")
+    get_sim().set_latency(ms)
     return {"ok": True}
 
 
@@ -193,7 +221,7 @@ async def add_nofly():
 
 @app.post("/api/control/traffic")
 async def add_traffic(data: dict[str, Any] | None = None):
-    count = (data or {}).get("count", 10)
+    count = _valid_count((data or {}).get("count", 10), maximum=500)
     await get_sim()._spawn_aircraft(count)
     return {"ok": True}
 
@@ -216,11 +244,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
 def _broadcast_snapshot(snapshot: dict[str, Any]) -> None:
     payload = json.dumps(snapshot, separators=(",", ":"))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
     for ws in list(_connected):
-        try:
-            asyncio.get_event_loop().create_task(ws.send_text(payload))
-        except Exception:
-            pass
+        loop.create_task(_safe_send(ws, payload))
+
+
+async def _safe_send(ws: WebSocket, payload: str) -> None:
+    try:
+        await ws.send_text(payload)
+    except Exception:
+        pass
 
 
 # ────────── static frontend (mounted last so /api and /ws win) ──────────

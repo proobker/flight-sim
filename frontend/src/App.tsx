@@ -57,7 +57,8 @@ export default function App() {
         style={{
           position: "absolute",
           top: 12,
-          right: 12,
+          left: "50%",
+          transform: "translateX(-50%)",
           padding: "3px 12px",
           borderRadius: 3,
           font: "11px/1.6 'Consolas', 'Courier New', monospace",

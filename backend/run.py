@@ -71,7 +71,7 @@ def run_server(args: argparse.Namespace) -> None:
 
     @app.on_event("startup")
     async def _startup():
-        await init_simulator(config)
+        await init_simulator(config, seed=args.seed)
 
     @app.on_event("shutdown")
     async def _shutdown():
