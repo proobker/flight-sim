@@ -134,3 +134,165 @@ canvas {
 .controls input[type="number"]::-webkit-inner-spin-button {
   opacity: 0.3;
 }
+
+/* ────── landing page ────── */
+
+.landing {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  z-index: 10;
+  transition: opacity 0.32s ease;
+}
+
+.landing.leaving {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.landing-scrim {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 50% 42%, rgba(10, 10, 26, 0.35) 0%, rgba(10, 10, 26, 0.72) 55%, rgba(10, 10, 26, 0.9) 100%),
+    linear-gradient(180deg, rgba(10, 14, 20, 0.3) 0%, rgba(10, 10, 26, 0.85) 100%);
+}
+
+.landing-radar {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.radar-sweep {
+  position: absolute;
+  width: 100vmin;
+  height: 100vmin;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(51, 255, 136, 0.14) 0deg,
+    rgba(51, 255, 136, 0.04) 45deg,
+    transparent 60deg
+  );
+  animation: spin 7s linear infinite;
+  pointer-events: none;
+}
+
+.radar-ring {
+  position: absolute;
+  border-radius: 50%;
+  border: 1px solid rgba(51, 255, 136, 0.18);
+  pointer-events: none;
+}
+
+.radar-ring.r1 {
+  width: 64vmin;
+  height: 64vmin;
+}
+
+.radar-ring.r2 {
+  width: 88vmin;
+  height: 88vmin;
+  border-color: rgba(51, 255, 136, 0.12);
+}
+
+.radar-ring.r3 {
+  width: 112vmin;
+  height: 112vmin;
+  border-color: rgba(51, 255, 136, 0.07);
+}
+
+.radar-core {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #33ff88;
+  box-shadow: 0 0 20px 6px rgba(51, 255, 136, 0.5);
+  animation: pulse 2s infinite;
+  pointer-events: none;
+}
+
+.landing-content {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 18px;
+  text-align: center;
+  z-index: 1;
+}
+
+.landing-title {
+  font-size: 56px;
+  font-weight: 700;
+  letter-spacing: 18px;
+  color: #eafff0;
+  text-shadow:
+    0 0 18px rgba(51, 255, 136, 0.45),
+    0 0 60px rgba(51, 255, 136, 0.2);
+}
+
+.landing-title span {
+  color: #33ff88;
+}
+
+.landing-sub {
+  font-size: 11px;
+  letter-spacing: 4px;
+  color: #779966;
+  text-transform: uppercase;
+}
+
+.landing-features {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 13px;
+  line-height: 2.1;
+  color: #aabb99;
+}
+
+.landing-bullet {
+  color: #33ff88;
+  margin-right: 8px;
+}
+
+.get-started {
+  margin-top: 6px;
+  padding: 12px 46px;
+  background: linear-gradient(180deg, #0f1c16, #0a1410);
+  color: #33ff88;
+  border: 1px solid #33ff88;
+  border-radius: 3px;
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 3px;
+  cursor: pointer;
+  text-transform: uppercase;
+  box-shadow: 0 0 18px rgba(51, 255, 136, 0.2);
+  transition: all 0.15s ease;
+}
+
+.get-started:hover {
+  filter: brightness(1.4);
+  box-shadow: 0 0 30px rgba(51, 255, 136, 0.4);
+}
+
+.get-started:active {
+  filter: brightness(0.9);
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
