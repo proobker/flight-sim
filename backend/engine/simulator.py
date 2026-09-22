@@ -16,7 +16,7 @@ from typing import Any
 from ..network.udp_node import UdpNode
 from ..simulation import physics
 from ..simulation.aircraft import Aircraft, CRUISE
-from ..simulation.airspace import Airspace, random_cruise_altitude
+from ..simulation.airspace import Airspace, cruise_altitude_over_route, random_cruise_altitude
 from ..simulation.conflict import ConflictDetector
 from ..simulation.fleet import assign_type
 from ..terminal import TerminalController
@@ -152,7 +152,12 @@ class Simulator:
             destination=dest_airport.position,
             speed=0.0,
             heading=dep_rwy.heading,
-            cruise_altitude=random_cruise_altitude(self._rng),
+            cruise_altitude=cruise_altitude_over_route(
+                random_cruise_altitude(self._rng),
+                self.airspace.terrain,
+                hold,
+                dest_airport.position,
+            ),
             priority=self._rng.choice([0, 0, 0, 0, 0, 1, 1, 2, 2, 4]),
             fleet=fleet,
         )
@@ -179,7 +184,12 @@ class Simulator:
         px = dest[0] + math.cos(ang) * dist
         py = dest[1] + math.sin(ang) * dist
         px, py, _ = self.airspace.enforce_bounds((px, py, self.config.cruise_altitude))
-        altitude = random_cruise_altitude(self._rng)
+        altitude = cruise_altitude_over_route(
+            random_cruise_altitude(self._rng),
+            self.airspace.terrain,
+            (px, py, 0.0),
+            dest,
+        )
         heading = math.atan2(dest[0] - px, dest[1] - py)
         ac = Aircraft(
             aircraft_id=aid,
@@ -243,7 +253,12 @@ class Simulator:
             destination=dest,
             speed=180.0,
             priority=4,
-            cruise_altitude=random_cruise_altitude(self._rng),
+            cruise_altitude=cruise_altitude_over_route(
+                random_cruise_altitude(self._rng),
+                self.airspace.terrain,
+                pos,
+                dest,
+            ),
         )
         ac.dest_aid = dest_port.aid
         ac.leg_distance = math.hypot(dest[0] - pos[0], dest[1] - pos[1])

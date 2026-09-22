@@ -8,7 +8,7 @@ import pytest
 from backend.simulation.airspace import Airspace
 from backend.simulation.aircraft import CRUISE
 from backend.simulation.fleet import AircraftType, NARROW, WIDEBODY
-from backend.simulation.terrain import TERRAIN_MIN_CLEARANCE, TerrainGrid
+from backend.simulation.terrain import CRUISE_TERRAIN_BUFFER, TERRAIN_MIN_CLEARANCE, TerrainGrid
 
 _FLEET = {
     "narrow": AircraftType(
@@ -309,3 +309,29 @@ def test_terrain_disabled_by_default():
     assert a.terrain_motion_clear((0, 0, 0), (1, 0, 0), 10.0)
     assert a.terrain_detour_waypoint((0, 0, 0), (100, 0, 0), 100.0) is None
     assert "terrain" not in a.snapshot()
+
+
+def test_initial_fleet_cruise_clears_route_crests(real_airspace):
+    """Every spawned fleet aircraft cruises clear of its route's tallest crest,
+    so the initial fleet never gets shunted onto a terrain-hugging altitude."""
+    import asyncio
+
+    from backend.engine.simulator import SimConfig, Simulator
+
+    sim = Simulator(SimConfig(num_aircraft=24))
+    sim._rng.seed(1)
+    wired: list = []
+    orig = sim._wire_agent
+    sim._wire_agent = lambda ac, port=None: wired.append(ac)
+    try:
+        asyncio.run(sim._spawn_aircraft())
+    finally:
+        sim._wire_agent = orig
+
+    tg = sim.airspace.terrain
+    assert len(wired) == 24
+    for ac in wired:
+        crest, _ = tg.max_along(ac.position, ac.destination, step=200.0)
+        assert ac.cruise_altitude >= crest + CRUISE_TERRAIN_BUFFER - 1e-6, (
+            f"{ac.id} cruises {ac.cruise_altitude:.0f} m below crest {crest:.0f} m + buffer"
+        )
