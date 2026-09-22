@@ -33,8 +33,10 @@ _PLATEAU_CAP_HUB = 3800.0
 _PLATEAU_CAP_RELIEF = 2600.0
 
 # Discrete cruise levels so neighbouring flights sit in different bands.
-# Now real-ish RVSM-scale levels for a 160 km terminal area.
-ALTITUDE_BANDS = [1500.0, 1800.0, 2100.0, 2400.0, 2800.0, 3200.0, 3600.0, 4000.0]
+# Spaced 600-900 m apart (well above the 300 m vertical separation standard
+# plus the +/-150 m jitter) so adjacent bands never conflict vertically;
+# the top band clears the tallest route crests (terrain zmax ~4700 m).
+ALTITUDE_BANDS = [1500.0, 2100.0, 2700.0, 3300.0, 4000.0, 4800.0, 5400.0]
 
 # Distance from an airport inside which terminal (3 km) separation applies
 # instead of the en-route (5 km) standard.
