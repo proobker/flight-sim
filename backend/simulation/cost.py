@@ -29,12 +29,14 @@ def plan_cost(plan, aircraft, *, deviation_weight: float = 1.0, delay_weight: fl
         heading_rate = abs(_angdiff(heading, aircraft.heading))
 
     deviation = heading_rate
+    ref_climb = max(getattr(aircraft, "climb_rate", 1.0), 1e-6)
     if abs(v[2]) > 1:
-        deviation += abs(v[2]) / aircraft.climb_rate * 0.5
-    if speed < aircraft.speed * 0.95:
-        deviation += (aircraft.speed - speed) / aircraft.speed * 1.0
-    elif speed > aircraft.speed * 1.05:
-        deviation += (speed - aircraft.speed) / aircraft.speed * 1.2
+        deviation += abs(v[2]) / ref_climb * 0.5
+    ref_speed = max(aircraft.speed, 1e-6)
+    if speed < ref_speed * 0.95:
+        deviation += (ref_speed - speed) / ref_speed * 1.0
+    elif speed > ref_speed * 1.05:
+        deviation += (speed - ref_speed) / ref_speed * 1.2
 
     multiplier = emergency_factor if aircraft.emergency else 1.0
     cost = (

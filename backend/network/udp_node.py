@@ -56,12 +56,14 @@ class UdpNode:
         latency_ms: float = 0.0,
         jitter_ms: float = 0.0,
         partition: str = "main",
+        rng=None,
     ) -> None:
         self.id = aircraft_id
         self.group = multicast_group
         self.port = multicast_port
         self.loop = loop or asyncio.get_event_loop()
         self.address = (multicast_group, multicast_port)
+        self._rng = rng if rng is not None else random
 
         self.partition = partition
         self.blocked_partitions: set[str] = set()
@@ -143,6 +145,7 @@ class UdpNode:
                 self.stats.dropped += 1
                 continue
             self.inbox.append(msg)
+            self.stats.delivered += 1
 
     def send(self, msg: dict[str, Any]) -> None:
         """Serialize and fire a datagram into the multicast group."""
@@ -152,21 +155,21 @@ class UdpNode:
             msg["sender"] = self.id
         msg["_partition"] = self.partition
 
-        if self.loss > 0.0 and random.random() < self.loss:
+        if self.loss > 0.0 and self._rng.random() < self.loss:
             self.stats.dropped += 1
             return
 
         delay_ms = self.latency_ms
         if self.jitter_ms > 0.0:
-            delay_ms += random.uniform(-self.jitter_ms, self.jitter_ms)
+            delay_ms += self._rng.uniform(-self.jitter_ms, self.jitter_ms)
         delay = max(0.0, delay_ms) / 1000.0
 
         self.stats.sent += 1
-        self.stats.queued_outgoing += 1
 
         if delay <= 0.0:
             self._fire(msg)
         else:
+            self.stats.queued_outgoing += 1
             self.loop.create_task(self._delayed_fire(delay, msg))
 
     def _fire(self, msg: dict[str, Any]) -> None:
@@ -179,6 +182,7 @@ class UdpNode:
 
     async def _delayed_fire(self, delay: float, msg: dict[str, Any]) -> None:
         await asyncio.sleep(delay)
+        self.stats.queued_outgoing = max(0, self.stats.queued_outgoing - 1)
         self._fire(msg)
 
     def set_loss(self, value: float) -> None:

@@ -79,11 +79,18 @@ class TerminalController:
         now: float,
         reenter: bool = False,
     ) -> float:
-        """Register an inbound and return the sim-time its slot opens."""
-        slots = self._slots.setdefault(runway, [])
-        if reenter:
-            slots = [s for s in slots if not (s.aid == aid and s.status == PENDING)]
-            self._slots[runway] = slots
+        """Register an inbound and return the sim-time its slot opens.
+
+        An aircraft may hold at most one in-flight (PENDING) slot per runway —
+        any earlier PENDING slot for the same aircraft is replaced. Completed
+        (LANDED/ABORTED) slots are kept as history but capped so a runway's
+        slot table cannot grow without bound.
+        """
+        slots = self._slots.get(runway, [])
+        slots = [s for s in slots if not (s.status == PENDING and s.aid == aid)]
+        completed = sorted((s for s in slots if s.status != PENDING), key=lambda s: s.eta, reverse=True)
+        slots = completed[:200] + [s for s in slots if s.status == PENDING]
+        self._slots[runway] = slots
         slots.append(Slot(aid=aid, runway=runway, wake=wake, eta=max(eta, now), open_at=max(eta, now)))
         slots.sort(key=lambda s: s.eta)
         # Re-chain the wake gaps in ETA order; the tower sequences arrivals.
@@ -153,8 +160,13 @@ class TerminalController:
         return True
 
     def note_departure(self, aid: str, runway: str, wake: str, now: float) -> None:
-        """Takeoff roll has begun; the runway must stay free for it."""
-        self._last_departure.setdefault(runway, (now, wake))
+        """Takeoff roll has begun; the runway must stay free for it.
+
+        Records the *actual* roll time (overwriting the earlier clearance
+        time written by ``clear_for_departure``) so departure gaps are
+        measured between consecutive rolls as documented.
+        """
+        self._last_departure[runway] = (now, wake)
         self._runway_busy_until[runway] = now + RUNWAY_CLEAR_AFTER_DEPARTURE
 
     def note_departure_airborne(self, runway: str, now: float) -> None:

@@ -30,6 +30,8 @@ class Metrics:
     def record_conflict(self, record: ConflictRecord) -> None:
         self.records.append(record)
         self.conflict_count += 1
+        if len(self.records) > 10000:
+            del self.records[: len(self.records) - 5000]
 
     def record_resolution(self, record: ConflictRecord, now: float) -> None:
         record.resolved_at = now
