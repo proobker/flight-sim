@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 const btnBase: React.CSSProperties = {
   display: "block",
@@ -60,6 +60,17 @@ export function ControlPanel() {
   const [latency, setLatency] = useState("");
   const [traffic, setTraffic] = useState("10");
 
+  const bleedTimer = useRef<number | null>(null);
+  const latencyTimer = useRef<number | null>(null);
+
+  const commitLater = (timer: React.MutableRefObject<number | null>, fn: () => void) => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      fn();
+    }, 150);
+  };
+
   return (
     <div className="panel controls">
       <h2>FAILURE INJECTION</h2>
@@ -78,8 +89,11 @@ export function ControlPanel() {
         Packet loss ({bleed || "0"}%)<br />
         <input
           type="range" min="0" max="100" value={bleed || "0"}
-          onChange={(e) => setBleed(e.target.value)}
-          onMouseUp={() => post("packet_loss", { value: Number(bleed) / 100 })}
+          onChange={(e) => {
+            const v = e.target.value;
+            setBleed(v);
+            commitLater(bleedTimer, () => post("packet_loss", { value: Number(v) / 100 }));
+          }}
           style={{ width: "100%", accentColor: "#33ff88" }}
         />
       </label>
@@ -87,8 +101,11 @@ export function ControlPanel() {
         Latency ({latency || "0"} ms)<br />
         <input
           type="number" min="0" max="5000" value={latency}
-          onChange={(e) => setLatency(e.target.value)}
-          onBlur={() => post("latency", { ms: Number(latency) || 0 })}
+          onChange={(e) => {
+            const v = e.target.value;
+            setLatency(v);
+            commitLater(latencyTimer, () => post("latency", { ms: Number(v) || 0 }));
+          }}
           style={inputStyle}
         />
       </label>
