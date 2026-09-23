@@ -105,6 +105,16 @@ const AIRPORT_GROUND_CLEARANCE = 4;
 // diving below the map; also keeps the near plane clear of steep slopes.
 const MIN_CAMERA_CLEARANCE = 400;
 
+// Closest the orbit camera may get to its pivot. Aircraft render ~156 m long
+// (PLANE_SCALE) and MIN_CAMERA_CLEARANCE is 400, so 500 is the tightest safe
+// close-in distance for inspecting planes without clipping the ground.
+const MIN_ZOOM_DISTANCE = 500;
+
+// Time constant (seconds) of the exponential ease applied to accumulated
+// wheel input — the MSFS "SmoothZoomTime" equivalent: ~95% of a flick is
+// consumed within 3 × this, so zoom glides instead of jumping per tick.
+const ZOOM_TIME_CONSTANT = 0.09;
+
 // The procedural aircraft model is built ~390 m long at "airliner" scale.
 // The body is scaled UP for legibility, not scaled to sit realistically on a
 // runway: at the default wide camera frame a realistic ~40 m airliner is a
@@ -613,6 +623,13 @@ export class SkyScene {
   private rafId: number | null = null;
   private disposed = false;
 
+  // Smooth-wheel-zoom state: wheel events accumulate here (in native deltaY
+  // units) and the render loop eases the camera toward the requested
+  // distance over a few frames instead of jumping per tick.
+  private pendingWheelDelta = 0;
+  private cursorNDC = new THREE.Vector2();
+  private lastAnimTime: number | null = null;
+
   boundsGroup: THREE.Group;
   skyStarField: THREE.Points | null = null;
   skySun: THREE.Sprite | null = null;
@@ -683,13 +700,26 @@ export class SkyScene {
     this.camera.position.set(6000, 9000, 18000);
     this.camera.lookAt(7500, 1500, 7500);
 
+    // Intercept the wheel BEFORE OrbitControls attaches its own listener
+    // (listeners on one element fire in registration order, so ours runs
+    // first and stopImmediatePropagation keeps OrbitControls from jumping
+    // the camera per tick). We accumulate input and ease it in animate().
+    this.renderer.domElement.addEventListener("wheel", this.onWheel, { passive: false });
+
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(7500, 1500, 7500);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.08;
+    this.controls.dampingFactor = 0.12;
     this.controls.maxPolarAngle = Math.PI * 0.48;
-    this.controls.minDistance = 1000;
+    this.controls.minDistance = MIN_ZOOM_DISTANCE;
     this.controls.maxDistance = 200000;
+    // Gentler than OrbitControls' 1.0 default: ~3.5% distance per wheel
+    // notch instead of 5%, so close-in aiming stays precise.
+    this.controls.zoomSpeed = 0.7;
+    // Aim the native dolly paths (middle-drag, touch pinch) at the pointer
+    // like a map camera. The wheel path is handled by onWheel/applySmoothZoom
+    // below with the same cursor-directed math.
+    this.controls.zoomToCursor = true;
 
     this.ambient = new THREE.AmbientLight(0xffffff, 0.35);
     this.scene.add(this.ambient);
@@ -801,6 +831,9 @@ export class SkyScene {
   }
 
   resetView() {
+    // Drop any in-flight eased zoom so it can't yank the camera after the
+    // reset lands.
+    this.pendingWheelDelta = 0;
     const air = this.lastSnapshot?.airspace;
     if (air) {
       const cx = air.width / 2;
@@ -947,6 +980,62 @@ export class SkyScene {
   }
 
   /**
+   * Smooth-zoom wheel sink. Registered on the canvas before OrbitControls so
+   * it runs first; stopImmediatePropagation stops the stock per-tick jump and
+   * the delta is accumulated for applySmoothZoom to ease out over the next
+   * few frames (SmoothZoomTime-style). Ctrl+wheel (trackpad pinch) deltas are
+   * scaled x10 to mirror OrbitControls' own _customWheelEvent.
+   */
+  private onWheel = (event: WheelEvent) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const delta = event.deltaY * (event.ctrlKey ? 10 : 1);
+    this.pendingWheelDelta += delta;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      this.cursorNDC.set(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -(((event.clientY - rect.top) / rect.height) * 2 - 1)
+      );
+    }
+  };
+
+  /**
+   * Consume one eased slice of the accumulated wheel input: dolly along the
+   * ray through the cursor and re-place the orbit target ahead of the camera,
+   * exactly like OrbitControls' zoomToCursor branch, but applied gradually so
+   * the zoom glides. Radius is clamped to [minDistance, maxDistance]; at a
+   * limit the camera holds while the target still realigns (stock behavior).
+   */
+  private applySmoothZoom(delta: number) {
+    if (delta === 0) return;
+    const scale = Math.pow(0.95, (-this.controls.zoomSpeed * delta) / 100);
+    const cam = this.camera.position;
+    const prevRadius = cam.distanceTo(this.controls.target);
+    const newRadius = Math.min(
+      this.controls.maxDistance,
+      Math.max(this.controls.minDistance, prevRadius * scale)
+    );
+    const radiusDelta = prevRadius - newRadius;
+    if (radiusDelta !== 0) {
+      this.camera.updateMatrixWorld();
+      const dir = new THREE.Vector3(this.cursorNDC.x, this.cursorNDC.y, 1)
+        .unproject(this.camera)
+        .sub(cam)
+        .normalize();
+      cam.addScaledVector(dir, radiusDelta);
+      this.camera.updateMatrixWorld();
+    }
+    // Position the orbit target in front of the new camera position at the
+    // new radius (OrbitControls screenSpacePanning path for zoomToCursor).
+    this.controls.target
+      .set(0, 0, -1)
+      .transformDirection(this.camera.matrix)
+      .multiplyScalar(newRadius)
+      .add(cam);
+  }
+
+  /**
    * Keep the camera above the terrain surface everywhere on the map: never
    * inside a mountain and never under the ground plane. When the elevation
    * grid is missing, heightAt returns 0, so the floor becomes the flat
@@ -970,19 +1059,43 @@ export class SkyScene {
    * Keep the orbit pivot on (not under) the terrain surface. The default pivot
    * is a fixed low altitude, but the map centre can be a ~3.5 km peak; a target
    * buried under it makes every wheel-zoom stall against clampCameraToTerrain.
-   * No-op until the authoritative grid is loaded.
+   * Runs every frame because cursor-directed zoom moves the target freely —
+   * without this a zoom toward a mountainside buries the pivot and stalls.
+   * No-op until the authoritative grid is loaded (or once Y already matches).
    */
   private snapOrbitTargetToTerrain() {
     if (!this.terrainEnabled()) return;
     const t = this.controls.target;
-    t.y = this.baseY() + this.heightAt(t.x, t.z) + MIN_CAMERA_CLEARANCE;
+    const y = this.baseY() + this.heightAt(t.x, t.z) + MIN_CAMERA_CLEARANCE;
+    if (t.y === y) return;
+    t.y = y;
     this.controls.update();
   }
 
-  private animate = () => {
+  private animate = (time?: number) => {
     if (this.disposed) return;
     this.rafId = requestAnimationFrame(this.animate);
+
+    // Ease accumulated wheel input toward its resting distance. dt is clamped
+    // so a backgrounded tab doesn't snap the camera on return.
+    if (this.pendingWheelDelta !== 0) {
+      const dt =
+        time !== undefined && this.lastAnimTime !== null
+          ? Math.min((time - this.lastAnimTime) / 1000, 0.1)
+          : 1 / 60;
+      const alpha = 1 - Math.exp(-dt / ZOOM_TIME_CONSTANT);
+      let step = this.pendingWheelDelta * alpha;
+      this.pendingWheelDelta -= step;
+      if (Math.abs(this.pendingWheelDelta) < 0.01) {
+        step += this.pendingWheelDelta;
+        this.pendingWheelDelta = 0;
+      }
+      this.applySmoothZoom(step);
+    }
+    this.lastAnimTime = time ?? null;
+
     this.controls.update();
+    this.snapOrbitTargetToTerrain();
     this.clampCameraToTerrain();
     // Skybox: keep the stars centred on the viewer so zooming out
     // or panning across the 160 km world can never walk out of them.
@@ -1662,6 +1775,7 @@ export class SkyScene {
     this.disposed = true;
     if (this.rafId !== null) cancelAnimationFrame(this.rafId);
     window.removeEventListener("resize", this.onResize);
+    this.renderer.domElement.removeEventListener("wheel", this.onWheel);
     this.controls.dispose();
     this.renderer.dispose();
     if (this.container.contains(this.renderer.domElement)) {
