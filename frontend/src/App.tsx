@@ -77,6 +77,7 @@ export default function App() {
           snapshotReady={!!snapshot}
           modelReady={sceneRef.current?.modelReady ?? false}
           terrainLoaded={sceneRef.current?.terrainLoaded ?? false}
+          liveCount={snapshot?.active ?? 0}
           onStart={handleStart}
         />
       )}
