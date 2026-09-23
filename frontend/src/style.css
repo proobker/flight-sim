@@ -157,8 +157,8 @@ canvas {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(ellipse at 50% 42%, rgba(10, 10, 26, 0.35) 0%, rgba(10, 10, 26, 0.72) 55%, rgba(10, 10, 26, 0.9) 100%),
-    linear-gradient(180deg, rgba(10, 14, 20, 0.3) 0%, rgba(10, 10, 26, 0.85) 100%);
+    radial-gradient(ellipse at 50% 42%, rgba(10, 10, 26, 0.1) 0%, rgba(10, 10, 26, 0.3) 55%, rgba(10, 10, 26, 0.55) 100%),
+    linear-gradient(180deg, rgba(10, 14, 20, 0.15) 0%, rgba(10, 10, 26, 0.55) 100%);
 }
 
 .landing-radar {
@@ -229,6 +229,8 @@ canvas {
   gap: 18px;
   text-align: center;
   z-index: 1;
+  padding: 30px 48px;
+  background: radial-gradient(ellipse at center, rgba(10, 10, 26, 0.62) 0%, rgba(10, 10, 26, 0.32) 55%, transparent 100%);
 }
 
 .landing-title {
@@ -290,6 +292,24 @@ canvas {
 
 .get-started:active {
   filter: brightness(0.9);
+}
+
+.landing-live {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 3px;
+  color: #33ff88;
+  text-shadow: 0 0 10px rgba(51, 255, 136, 0.5);
+}
+
+.landing-live-dot {
+  color: #33ff88;
+  animation: pulse 1.6s infinite;
+  text-shadow: 0 0 8px rgba(51, 255, 136, 0.8);
 }
 
 @keyframes spin {

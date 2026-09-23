@@ -40,6 +40,7 @@ export const Landing = memo(function Landing({
   snapshotReady,
   modelReady,
   terrainLoaded,
+  liveCount,
   onStart,
 }: {
   leaving: boolean;
@@ -47,6 +48,7 @@ export const Landing = memo(function Landing({
   snapshotReady: boolean;
   modelReady: boolean;
   terrainLoaded: boolean;
+  liveCount: number;
   onStart: () => void;
 }) {
   return (
@@ -78,6 +80,11 @@ export const Landing = memo(function Landing({
         <button className="get-started" onClick={onStart} autoFocus>
           GET STARTED&nbsp; &#9654;
         </button>
+
+        <div className="landing-live" >
+          <span className="landing-live-dot">&#9679;</span>
+          {liveCount} AIRCRAFT LIVE
+        </div>
 
         <div style={statusStyle}>
           <StatusItem label="SOCKET" ok={connected} />

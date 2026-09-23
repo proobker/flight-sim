@@ -105,11 +105,13 @@ const AIRPORT_GROUND_CLEARANCE = 4;
 // diving below the map; also keeps the near plane clear of steep slopes.
 const MIN_CAMERA_CLEARANCE = 400;
 
-// The procedural aircraft model is built ~390 m long at "airliner" scale, so
-// a plane would dwarf the 50 m runways. Scale the body by this factor so the
-// aircraft sits on the field like a real airliner (~40 m). Tags, prediction
-// arrows and trails live on the unscaled outer group and stay readable.
-const PLANE_SCALE = 0.1;
+// The procedural aircraft model is built ~390 m long at "airliner" scale.
+// The body is scaled UP for legibility, not scaled to sit realistically on a
+// runway: at the default wide camera frame a realistic ~40 m airliner is a
+// sub-pixel smudge, so the fleet would read as floating tags. ~0.4 keeps each
+// plane a clearly visible 3D object while tags, prediction arrows and trails
+// live on the unscaled outer group and stay readable.
+const PLANE_SCALE = 0.4;
 
 // The whole airport site renders ~2x bigger so each field reads as a proper
 // airport now that the aircraft are ~40 m: pad, apron, terminal and beacon are
@@ -297,6 +299,16 @@ function loadGlbModel(): Promise<THREE.Group | null> {
               if (o instanceof THREE.Mesh) {
                 o.castShadow = true;
                 o.frustumCulled = true;
+                // GLTFExporter bakes MeshPhongMaterial into a semi-metallic
+                // MeshStandardMaterial (metalness 0.5 / roughness 0.5) which
+                // renders near-black under the dim night lights. Force matte so
+                // the airframe reads at night; the per-frame phase tint still
+                // recolours it.
+                const m = o.material as THREE.Material | THREE.Material[];
+                for (const mat of Array.isArray(m) ? m : [m]) {
+                  if ("metalness" in mat) (mat as THREE.MeshStandardMaterial).metalness = 0;
+                  if ("roughness" in mat) (mat as THREE.MeshStandardMaterial).roughness = 1;
+                }
               }
             });
             sharedGlb = root;
